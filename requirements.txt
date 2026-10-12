@@ -1,0 +1,5 @@
+streamlit
+pandas
+pypdf
+google-api-python-client
+google-auth
