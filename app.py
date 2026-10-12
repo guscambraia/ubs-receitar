@@ -8,7 +8,7 @@ import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, TextStringObject, DictionaryObject
+from pypdf.generic import NameObject, TextStringObject
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -85,7 +85,7 @@ def remover_acentos(texto: str) -> str:
 
 def limpar_endereco_esus(end_bruto: str) -> str:
     """
-    Converte o endereço do e-SUS:
+    Formata o endereço do e-SUS:
     De: 'Rua CAPINÓPOLIS, 241. CATALÃO, Divinópolis - MG | 35501-230'
     Para: 'Rua CAPINÓPOLIS, 241, CATALÃO, Divinópolis - MG'
     """
@@ -94,14 +94,10 @@ def limpar_endereco_esus(end_bruto: str) -> str:
     texto = str(end_bruto).strip()
     if texto.lower() in ["", "-", "nan", "none", "nao informada", "nao informado"]:
         return ""
-    # Impede que um CPF seja interpretado como endereço
     if re.match(r"^CPF\s*:", texto, flags=re.IGNORECASE):
         return ""
-    # Remove o '| CEP' do final
     texto = texto.split("|")[0].strip()
-    # Troca o ponto logo após o número (ex: ', 241. BAIRRO' ou ', S/N. BAIRRO') por vírgula
     texto = re.sub(r",\s*(\d+|S/N)\.\s*", r", \1, ", texto, flags=re.IGNORECASE)
-    # Troca ' - ' antes do bairro por ', ' apenas se houver outro ' - UF' no final
     partes_hifen = texto.split(" - ")
     if len(partes_hifen) >= 3:
         texto = ", ".join(partes_hifen[:-1]) + " - " + partes_hifen[-1]
@@ -109,11 +105,9 @@ def limpar_endereco_esus(end_bruto: str) -> str:
 
 @st.cache_data(ttl=3600)
 def carregar_base_pacientes() -> pd.DataFrame:
-    """Lê o arquivo pacientes.csv do e-SUS garantindo o alinhamento exato das colunas."""
     csv_id = st.secrets["drive"]["csv_file_id"]
     conteudo_bytes = baixar_arquivo_drive(csv_id)
     
-    # Tenta UTF-8 primeiro; se houver bytes Latin1/Windows-1252 (padrão e-SUS), usa cp1252
     texto_decodificado = None
     for enc in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
         try:
@@ -144,7 +138,6 @@ def carregar_base_pacientes() -> pd.DataFrame:
         index_col=False
     )
     
-    # Mapeia cada coluna pelo seu nome sem acento
     col_map = {remover_acentos(c): c for c in df.columns}
     
     col_cpf = col_map.get("CPF/CNS") or col_map.get("CPF")
@@ -163,7 +156,6 @@ def carregar_base_pacientes() -> pd.DataFrame:
     df["nome_busca"] = df["nome_limpo"].apply(remover_acentos)
     df["nascimento_limpo"] = df[col_nasc].fillna("").astype(str).str.strip() if col_nasc else ""
     
-    # Monta o endereço limpo para cada linha (suporta coluna única 'Endereço' ou colunas separadas)
     enderecos_finais = []
     for _, row in df.iterrows():
         end_str = ""
@@ -196,7 +188,7 @@ def carregar_base_pacientes() -> pd.DataFrame:
     df = df[(df["nome_limpo"] != "") | (df["doc_limpo"] != "")].copy()
     return df
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def carregar_pdf_template() -> bytes:
     pdf_id = st.secrets["drive"]["pdf_template_id"]
     return baixar_arquivo_drive(pdf_id)
@@ -228,7 +220,6 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
     if df.empty:
         return []
         
-    # 1. Busca pelo CPF (com ou sem pontuação)
     cpfs_encontrados = re.findall(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", texto_pec)
     for cpf_str in cpfs_encontrados:
         num = re.sub(r"\D", "", cpf_str)
@@ -236,14 +227,12 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
         if not achados.empty:
             return [extrair_dados_linha(row) for _, row in achados.iterrows()]
             
-    # 2. Busca pelo CNS (15 dígitos)
     cns_encontrados = re.findall(r"\b\d{15}\b", re.sub(r"[.\-]", "", texto_pec))
     for cns_str in cns_encontrados:
         achados = df[df["doc_limpo"] == cns_str]
         if not achados.empty:
             return [extrair_dados_linha(row) for _, row in achados.iterrows()]
 
-    # 3. Busca pelo Nome Completo
     texto_norm = remover_acentos(texto_pec)
     if len(texto_norm) >= 3:
         mask_nome_inteiro = df["nome_busca"].apply(lambda n: len(n) >= 5 and n in texto_norm)
@@ -325,99 +314,148 @@ def salvar_prescricao_drive(identificador_limpo: str, nome_paciente: str, texto_
     
     return nome_referencia
 
-def calcular_tamanho_fonte_prescricao(texto: str) -> float:
+def otimizar_texto_prescricao(texto: str, compactar_automatico: bool = True) -> tuple[str, float]:
     """
-    Replica e aprimora o JavaScript 'formatarPrescricao()' do template.pdf:
-    Fonte Lato com tamanho máximo 8, reduzindo progressivamente conforme
-    a quantidade de caracteres e o total de linhas da prescrição.
+    1. Se 'compactar_automatico' estiver ativo e a receita tiver muitas linhas vazias,
+       remove linhas em branco duplicadas/triplas e encurta tracejados excessivos ('---')
+       para que a palavra 'CONT' ou a quantidade não quebre para a linha de baixo.
+    2. Calcula o tamanho exato da fonte Lato (máx. 8.0 pt, mín. 5.0 pt) para caber
+       nos 322 pontos de altura do campo PRESCRIÇÃO do template.pdf.
     """
-    texto_limpo = (texto or "").strip()
-    total_caracteres = len(texto_limpo)
-    
-    # Calcula o total de linhas visuais (considerando quebras de linha e linhas longas > 75 cols)
-    linhas = texto_limpo.splitlines()
-    total_linhas_visuais = sum(max(1, (len(l) // 75) + 1) for l in linhas)
-    
-    # 1. Pela regra original de caracteres do JavaScript embutido
-    if total_caracteres > 1300:
-        tam_char = 6.0
-    elif total_caracteres > 1050:
-        tam_char = 6.5
-    elif total_caracteres > 850:
-        tam_char = 7.0
-    elif total_caracteres > 650:
-        tam_char = 7.5
-    else:
-        tam_char = 8.0
-        
-    # 2. Pela altura da caixa PRESCRIÇÃO (322 pt de altura no template.pdf)
-    if total_linhas_visuais > 42:
-        tam_linha = 5.5
-    elif total_linhas_visuais > 36:
-        tam_linha = 6.0
-    elif total_linhas_visuais > 32:
-        tam_linha = 6.5
-    elif total_linhas_visuais > 28:
-        tam_linha = 7.0
-    elif total_linhas_visuais > 24:
-        tam_linha = 7.5
-    else:
-        tam_linha = 8.0
-        
-    return min(tam_char, tam_linha)
+    texto_proc = (texto or "").strip()
+    if not texto_proc:
+        return "", 8.0
 
-def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pac: str, campo_presc: str) -> bytes:
+    # Encurta sequências de mais de 55 hifens para evitar quebra de linha desnecessária
+    def ajustar_tracos(linha: str) -> str:
+        if "-----" in linha and len(linha) > 90:
+            excesso = len(linha) - 88
+            return re.sub(r"-{" + str(excesso + 5) + r",}", lambda m: "-" * max(10, len(m.group(0)) - excesso), linha, count=1)
+        return linha
+
+    linhas_orig = [ajustar_tracos(l.rstrip()) for l in texto_proc.splitlines()]
+    texto_proc = "\n".join(linhas_orig)
+
+    if compactar_automatico and len(linhas_orig) > 26:
+        # 1º Nível: Colapsa 2 ou 3 linhas vazias seguidas em apenas 1 linha vazia,
+        # e junta a linha do medicamento ("1. ...") diretamente à sua posologia abaixo
+        texto_nivel1 = re.sub(r"\n\s*\n+", "\n\n", texto_proc)
+        texto_nivel1 = re.sub(
+            r"(^\s*(?:\d+\.|USO\s).+)\n\n+(?=\S)",
+            r"\1\n",
+            texto_nivel1,
+            flags=re.MULTILINE | re.IGNORECASE
+        )
+        linhas_n1 = texto_nivel1.splitlines()
+        
+        # Se ainda passar de 42 linhas, aplica o 2º nível (1 linha por item, separando apenas blocos de USO/OBS)
+        if len(linhas_n1) > 42:
+            nao_vazias = [l for l in linhas_n1 if l.strip()]
+            out_n2 = []
+            for idx, l in enumerate(nao_vazias):
+                if idx > 0 and re.match(r"^\s*(USO\s|OBS)", l, re.IGNORECASE):
+                    out_n2.append("")
+                out_n2.append(l)
+            texto_proc = "\n".join(out_n2)
+        else:
+            texto_proc = texto_nivel1
+
+    linhas_finais = texto_proc.splitlines()
+    # Conta quantas linhas visuais serão ocupadas considerando quebras horizontais (~85 cols)
+    total_linhas_visuais = sum(max(1, (len(l) // 85) + 1) for l in linhas_finais)
+    total_chars = len(texto_proc)
+
+    # Cálculo matemático para caber em 312 pt úteis de altura (espaçamento de 1.38 * font_size)
+    # font_size <= 312 / (1.38 * total_linhas_visuais)
+    if total_linhas_visuais <= 26 and total_chars <= 650:
+        tamanho = 8.0
+    else:
+        tam_altura = 312.0 / (1.38 * max(1, total_linhas_visuais))
+        # Arredonda para múltiplos de 0.5 (ou 0.25) entre 5.0 e 8.0
+        tamanho = max(5.0, min(8.0, round(tam_altura * 2) / 2))
+
+    return texto_proc, tamanho
+
+def preencher_pdf_template(
+    dados_paciente: dict,
+    texto_prescricao: str,
+    campo_pac: str,
+    campo_presc: str,
+    compactar_automatico: bool = True
+) -> tuple[bytes, float]:
     """
-    Preenche os campos CIDADÃO, PRESCRIÇÃO, DATA e DATA_HORA no template.pdf,
-    mantendo a fonte Lato (máx. 8 no CIDADÃO e dinâmica de 8 a 5.5 na PRESCRIÇÃO).
+    Preenche o template.pdf:
+    - Remove qualquer JavaScript antigo do campo CIDADÃO para não sobrescrever o endereço com o CPF;
+    - Define a fonte Lato com tamanho dinâmico ANTES de gerar a aparência visual (/AP);
+    - Atualiza o JavaScript interno do PDF para manter o mesmo tamanho no Adobe Acrobat.
     """
     pdf_bytes = carregar_pdf_template()
     writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
     
-    # Formatação exata solicitada para o campo CIDADÃO:
-    # Linha 1: João da Silva - CPF: 000.000.000-00
-    # Linha 2: Rua das Flores, 123, Centro, Cidade - MG
+    # Formatação exata do campo CIDADÃO:
+    # João da Silva - CPF: 000.000.000-00
+    # Rua das Flores, 123, Centro, Cidade - MG
     linha_1 = f"{dados_paciente['nome']} - CPF: {dados_paciente['cpf_formatado']}"
     endereco_val = limpar_endereco_esus(dados_paciente.get("endereco", ""))
     cabecalho_cidadao = f"{linha_1}\n{endereco_val}" if endereco_val else linha_1
     
-    # Calcula o tamanho ideal da fonte Lato (máx 8) para a prescrição
-    tamanho_lato = calcular_tamanho_fonte_prescricao(texto_prescricao)
+    # Otimiza quebras de linha excessivas e calcula tamanho ideal da fonte Lato (máx 8)
+    texto_final_presc, tamanho_lato = otimizar_texto_prescricao(texto_prescricao, compactar_automatico)
     tamanho_str = str(int(tamanho_lato)) if tamanho_lato == int(tamanho_lato) else str(tamanho_lato)
     
-    # Data e hora atuais no fuso horário de Minas Gerais (igual ao script AoAbrir do PDF)
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
     texto_data = f"Divinópolis - MG, {agora.strftime('%d')} de {MESES_PT[agora.month - 1]} de {agora.year}"
     texto_data_hora = f"{agora.strftime('%d/%m/%Y')} às {agora.strftime('%H:%M')}"
     
     valores_campos = {
         campo_pac: cabecalho_cidadao,
-        campo_presc: texto_prescricao,
+        campo_presc: texto_final_presc,
         "DATA": texto_data,
         "DATA_HORA": texto_data_hora
     }
     
+    # PASSO CRÍTICO 1: Atualiza /DA e limpa ações (/AA) ANTES de update_page_form_field_values
+    if "/AcroForm" in writer._root_object and "/Fields" in writer._root_object["/AcroForm"]:
+        for field_ref in writer._root_object["/AcroForm"]["/Fields"]:
+            field_obj = field_ref.get_object()
+            nome_f = field_obj.get("/T")
+            if nome_f == campo_pac:
+                field_obj[NameObject("/DA")] = TextStringObject("/Lato 8 Tf 0 g")
+                if "/AA" in field_obj:
+                    del field_obj["/AA"]
+            elif nome_f == campo_presc:
+                field_obj[NameObject("/DA")] = TextStringObject(f"/Lato {tamanho_str} Tf 0 g")
+                # Substitui o gatilho OnBlur (/Bl) do campo PRESCRIÇÃO para fixar o tamanho calculado
+                if "/AA" in field_obj:
+                    del field_obj["/AA"]
+
     for pagina in writer.pages:
-        writer.update_page_form_field_values(pagina, valores_campos)
-        
-        # Ajusta diretamente a propriedade /DA (Default Appearance) do campo PRESCRIÇÃO e CIDADÃO
-        # para garantir que a fonte Lato com tamanho dinâmico seja aplicada em qualquer navegador
         if "/Annots" in pagina:
             for annot_ref in pagina["/Annots"]:
                 annot = annot_ref.get_object()
                 nome_campo = annot.get("/T")
-                if nome_campo == campo_presc:
-                    annot[NameObject("/DA")] = TextStringObject(f"/Lato {tamanho_str} Tf 0 g")
-                elif nome_campo == campo_pac:
+                if nome_campo == campo_pac:
                     annot[NameObject("/DA")] = TextStringObject("/Lato 8 Tf 0 g")
-                    
-    # Também adiciona chamada ao formatarPrescricao() ao abrir o documento no Adobe Reader
-    writer.set_need_appearances_writer()
-    
+                    if "/AA" in annot:
+                        del annot["/AA"]
+                elif nome_campo == campo_presc:
+                    annot[NameObject("/DA")] = TextStringObject(f"/Lato {tamanho_str} Tf 0 g")
+                    if "/AA" in annot:
+                        del annot["/AA"]
+                        
+        # PASSO CRÍTICO 2: Agora gera o fluxo visual (/AP) já com a fonte Lato reduzida
+        writer.update_page_form_field_values(pagina, valores_campos)
+
+    # PASSO CRÍTICO 3: Remove scripts antigos do catálogo /Names que possam sobrescrever CIDADÃO ou PRESCRIÇÃO
+    if "/Names" in writer._root_object:
+        names_obj = writer._root_object["/Names"].get_object()
+        if "/JavaScript" in names_obj:
+            del names_obj["/JavaScript"]
+            
     output_buffer = io.BytesIO()
     writer.write(output_buffer)
     output_buffer.seek(0)
-    return output_buffer.read()
+    return output_buffer.read(), tamanho_lato
 
 # ==========================================
 # 5. MENU LATERAL E CONFIGURAÇÕES
@@ -430,6 +468,12 @@ with st.sidebar:
     )
     
     st.divider()
+    compactar_auto = st.checkbox(
+        "Compactar linhas em branco extras automaticamente em prescrições grandes",
+        value=True,
+        help="Remove espaços duplos/triplos entre medicamentos quando a receita for longa para que nenhum item fique cortado."
+    )
+    
     with st.expander("⚙️ Conferência de Campos e Base"):
         try:
             df_teste = carregar_base_pacientes()
@@ -484,7 +528,6 @@ if aba_selecionada == "📝 Emitir Prescrição":
                 
             st.success("✅ Paciente localizado na base de dados!")
             
-            # Permite visualizar e, se desejar, complementar o endereço caso esteja em branco no CSV
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 1, 1])
                 c1.markdown(f"**Nome Completo:** {paciente['nome']}")
@@ -495,6 +538,7 @@ if aba_selecionada == "📝 Emitir Prescrição":
                 endereco_editavel = st.text_input(
                     "📍 Endereço (extraído do CSV para sair na 2ª linha do campo CIDADÃO):",
                     value=paciente["endereco"],
+                    key=f"end_{paciente['cpf_limpo']}",
                     placeholder="Rua, Número, Complemento, Bairro, Cidade - MG"
                 )
                 paciente["endereco"] = endereco_editavel.strip()
@@ -529,8 +573,11 @@ if aba_selecionada == "📝 Emitir Prescrição":
                 height=260
             )
             
-            tam_previsto = calcular_tamanho_fonte_prescricao(texto_editado)
-            st.caption(f"🔤 Tamanho automático da fonte **Lato** para esta prescrição: **{tam_previsto} pt** (Máx: 8 pt)")
+            texto_otimizado_previa, tam_previsto = otimizar_texto_prescricao(texto_editado, compactar_auto)
+            st.caption(
+                f"🔤 Fonte **Lato** calculada automaticamente: **{tam_previsto} pt** (Máx: 8 pt) | "
+                f"Linhas no PDF: **{len(texto_otimizado_previa.splitlines())}**"
+            )
             
             if st.button("🖨️ Gerar Prescrição, Salvar no Drive e Imprimir", type="primary"):
                 if not texto_editado.strip():
@@ -538,19 +585,20 @@ if aba_selecionada == "📝 Emitir Prescrição":
                 else:
                     with st.spinner("Salvando histórico no Google Drive e preenchendo PDF..."):
                         try:
-                            nome_txt_salvo = salvar_prescricao_drive(id_busca, paciente["nome"], texto_editado)
+                            nome_txt_salvo = salvar_prescricao_drive(id_busca, paciente["nome"], texto_otimizado_previa)
                             st.success(f"✅ Prescrição registrada no histórico (`{nome_txt_salvo}`) e PDF gerado!")
                         except Exception as erro_drive:
                             st.warning(f"⚠️ O PDF foi gerado, mas houve um aviso ao atualizar o histórico no Drive: {erro_drive}")
                         
-                        pdf_final_bytes = preencher_pdf_template(
+                        pdf_final_bytes, _ = preencher_pdf_template(
                             dados_paciente=paciente,
                             texto_prescricao=texto_editado,
                             campo_pac=campo_pac_input,
-                            campo_presc=campo_presc_input
+                            campo_presc=campo_presc_input,
+                            compactar_automatico=compactar_auto
                         )
                         
-                        st.session_state["texto_prescricao_atual"] = texto_editado
+                        st.session_state["texto_prescricao_atual"] = texto_otimizado_previa
                         
                     agora_local = datetime.now(ZoneInfo("America/Sao_Paulo"))
                     nome_pdf_download = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{agora_local.strftime('%d-%m-%Y')}.pdf"
@@ -616,11 +664,12 @@ elif aba_selecionada == "🗂️ Histórico de Pacientes":
                                     disabled=True,
                                     key=f"txt_{item['file_id']}"
                                 )
-                                pdf_reimpressao = preencher_pdf_template(
+                                pdf_reimpressao, _ = preencher_pdf_template(
                                     dados_paciente=dados_pac,
                                     texto_prescricao=texto_hist,
                                     campo_pac=campo_pac_input,
-                                    campo_presc=campo_presc_input
+                                    campo_presc=campo_presc_input,
+                                    compactar_automatico=compactar_auto
                                 )
                                 st.download_button(
                                     label="⬇️ Baixar PDF desta data",
