@@ -2,9 +2,11 @@ import streamlit as st
 import pandas as pd
 import re
 import io
+import json
 import base64
 import unicodedata
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pypdf import PdfReader, PdfWriter
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -22,6 +24,10 @@ st.set_page_config(
 # Nomes exatos dos campos de formulário no seu PDF Template
 NOME_CAMPO_PACIENTE_PDF = "CIDADÃO"
 NOME_CAMPO_PRESCRICAO_PDF = "PRESCRIÇÃO"
+
+# Nome e ID padrão do arquivo de histórico criado na sua pasta Historico_TXT
+NOME_ARQUIVO_HISTORICO = "historico_prescricoes.json"
+ID_PADRAO_HISTORICO = "1RFtMetxdO2B8MioNsSC9SMi7MiUMCDC_"
 
 # ==========================================
 # 2. SISTEMA DE LOGIN (COM ST.SECRETS)
@@ -59,7 +65,7 @@ drive_service = conectar_drive()
 
 def baixar_arquivo_drive(file_id: str) -> bytes:
     """Baixa qualquer arquivo do Google Drive para a memória RAM (em bytes)."""
-    request = drive_service.files().get_media(fileId=file_id)
+    request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
     concluido = False
@@ -85,7 +91,6 @@ def carregar_base_pacientes() -> pd.DataFrame:
     csv_id = st.secrets["drive"]["csv_file_id"]
     conteudo_bytes = baixar_arquivo_drive(csv_id)
     
-    # Decodifica tratando o padrão Windows/e-SUS (cp1252 / latin1) ou UTF-8
     texto_decodificado = None
     for enc in ["cp1252", "latin1", "utf-8-sig", "utf-8"]:
         try:
@@ -99,7 +104,6 @@ def carregar_base_pacientes() -> pd.DataFrame:
         
     linhas = texto_decodificado.splitlines()
     
-    # Encontra automaticamente a linha onde começa "Nome equipe;INE equipe;...;CPF/CNS;Nome"
     indice_cabecalho = 0
     for i, linha in enumerate(linhas[:35]):
         if "CPF/CNS" in linha or ("CPF" in linha.upper() and "NOME" in linha.upper()):
@@ -116,10 +120,8 @@ def carregar_base_pacientes() -> pd.DataFrame:
         index_col=False
     )
     
-    # Remove espaços extras dos nomes das colunas
     df.columns = [str(col).strip() for col in df.columns]
     
-    # Cria colunas auxiliares limpas para busca rápida por CPF/CNS e por Nome
     col_cpf = "CPF/CNS" if "CPF/CNS" in df.columns else ("CPF" if "CPF" in df.columns else df.columns[4])
     col_nome = "Nome" if "Nome" in df.columns else df.columns[5]
     col_end = "Endereço" if "Endereço" in df.columns else df.columns[3]
@@ -159,8 +161,6 @@ def extrair_dados_linha(linha: pd.Series) -> dict:
     doc_limpo = linha["doc_limpo"]
     end_bruto = linha["endereco_bruto"]
     
-    # Exemplo no CSV: "Rua CAPINÓPOLIS, 241. CATALÃO, Divinópolis - MG | 35501-230"
-    # Cortando no "|" ficamos apenas com: "Rua CAPINÓPOLIS, 241. CATALÃO, Divinópolis - MG"
     endereco_sem_cep = end_bruto.split("|")[0].strip() if end_bruto and end_bruto != "-" else "Endereço não informado"
     
     return {
@@ -181,7 +181,6 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
     if df.empty:
         return []
         
-    # 1. Busca por CPF (formato 000.000.000-00 ou sequência de 11 dígitos)
     cpfs_encontrados = re.findall(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", texto_pec)
     for cpf_str in cpfs_encontrados:
         num = re.sub(r"\D", "", cpf_str)
@@ -189,14 +188,12 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
         if not achados.empty:
             return [extrair_dados_linha(row) for _, row in achados.iterrows()]
             
-    # 2. Busca por CNS (15 dígitos)
     cns_encontrados = re.findall(r"\b\d{15}\b", re.sub(r"[.\-]", "", texto_pec))
     for cns_str in cns_encontrados:
         achados = df[df["doc_limpo"] == cns_str]
         if not achados.empty:
             return [extrair_dados_linha(row) for _, row in achados.iterrows()]
 
-    # 3. Busca pelo Nome do paciente contido no texto do PEC
     texto_norm = remover_acentos(texto_pec)
     if len(texto_norm) >= 3:
         mask_nome_inteiro = df["nome_busca"].apply(lambda n: len(n) >= 5 and n in texto_norm)
@@ -211,66 +208,84 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
 
     return []
 
-def listar_prescricoes_drive(identificador_limpo: str = None) -> list:
-    """Lista os arquivos .txt de prescrições salvos na pasta privada do Drive."""
-    pasta_id = st.secrets["drive"]["folder_historico_id"]
-    query = f"'{pasta_id}' in parents and mimeType = 'text/plain' and trashed = false"
-    if identificador_limpo:
-        query += f" and name contains '{identificador_limpo}_'"
+def obter_id_arquivo_historico() -> str:
+    """
+    Localiza o arquivo 'historico_prescricoes.json' dentro da pasta Historico_TXT.
+    Como esse arquivo pertence à conta principal, a Service Account pode atualizá-lo
+    via files().update() sem erro de quota de armazenamento.
+    """
+    if "history_file_id" in st.secrets["drive"]:
+        return st.secrets["drive"]["history_file_id"]
         
-    resultados = drive_service.files().list(
+    pasta_id = st.secrets["drive"]["folder_historico_id"]
+    query = f"'{pasta_id}' in parents and name = '{NOME_ARQUIVO_HISTORICO}' and trashed = false"
+    res = drive_service.files().list(
         q=query,
-        orderBy="createdTime desc",
-        pageSize=100,
-        fields="files(id, name, createdTime)"
+        pageSize=1,
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
-    
-    arquivos = resultados.get("files", [])
-    lista_formatada = []
-    
-    for arq in arquivos:
-        nome_arq = arq["name"].replace(".txt", "")
-        partes = nome_arq.split("_")
-        cpf_arq = partes[0] if len(partes) >= 1 else ""
-        data_arq = partes[-2].replace("-", "/") if len(partes) >= 3 else ""
-        hora_arq = partes[-1].replace("-", ":") if len(partes) >= 3 else ""
-        
-        lista_formatada.append({
-            "file_id": arq["id"],
-            "nome_arquivo": arq["name"],
-            "cpf_limpo": cpf_arq,
-            "data_hora_str": f"{data_arq} às {hora_arq}".strip(" às "),
-            "createdTime": arq.get("createdTime", "")
-        })
-    return lista_formatada
+    arquivos = res.get("files", [])
+    if arquivos:
+        return arquivos[0]["id"]
+    return ID_PADRAO_HISTORICO
 
-def ler_texto_prescricao_drive(file_id: str) -> str:
-    """Lê o conteúdo de um arquivo .txt de prescrição salvo no Google Drive."""
-    conteudo_bytes = baixar_arquivo_drive(file_id)
-    return conteudo_bytes.decode("utf-8", errors="replace")
+def carregar_todo_historico_drive() -> list:
+    """Lê a lista de prescrições salva no arquivo historico_prescricoes.json do Drive."""
+    try:
+        arq_id = obter_id_arquivo_historico()
+        conteudo = baixar_arquivo_drive(arq_id).decode("utf-8", errors="replace").strip()
+        if not conteudo:
+            return []
+        dados = json.loads(conteudo)
+        return dados if isinstance(dados, list) else []
+    except Exception:
+        return []
 
-def salvar_prescricao_drive(identificador_limpo: str, texto_prescricao: str) -> str:
-    """Salva a prescrição como arquivo .txt no formato CPF_DD-MM-YYYY_HH-MM.txt."""
-    pasta_id = st.secrets["drive"]["folder_historico_id"]
-    agora = datetime.now()
-    nome_arquivo = f"{identificador_limpo}_{agora.strftime('%d-%m-%Y_%H-%M')}.txt"
+def listar_prescricoes_drive(identificador_limpo: str = None) -> list:
+    """Filtra as prescrições de um paciente específico (ordenadas da mais recente para a mais antiga)."""
+    registros = carregar_todo_historico_drive()
+    if identificador_limpo:
+        registros = [r for r in registros if r.get("cpf_limpo") == identificador_limpo]
+    return registros
+
+def salvar_prescricao_drive(identificador_limpo: str, nome_paciente: str, texto_prescricao: str) -> str:
+    """
+    Adiciona a nova prescrição no arquivo 'historico_prescricoes.json' usando files().update()
+    para usar a quota do proprietário da pasta e evitar o erro 403 de Service Account.
+    """
+    arq_id = obter_id_arquivo_historico()
+    registros = carregar_todo_historico_drive()
     
-    metadados = {
-        "name": nome_arquivo,
-        "parents": [pasta_id],
-        "mimeType": "text/plain"
+    agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
+    codigo_registro = f"{identificador_limpo}_{agora.strftime('%d-%m-%Y_%H-%M-%S')}"
+    nome_referencia = f"{identificador_limpo}_{agora.strftime('%d-%m-%Y_%H-%M')}.txt"
+    data_hora_str = agora.strftime("%d/%m/%Y às %H:%M")
+    
+    novo_item = {
+        "file_id": codigo_registro,
+        "nome_arquivo": nome_referencia,
+        "cpf_limpo": identificador_limpo,
+        "nome": nome_paciente,
+        "data_hora_str": data_hora_str,
+        "texto": texto_prescricao,
+        "createdTime": agora.isoformat()
     }
-    media = MediaIoBaseUpload(
-        io.BytesIO(texto_prescricao.encode("utf-8")),
-        mimetype="text/plain",
-        resumable=False
-    )
-    arquivo = drive_service.files().create(
-        body=metadados,
+    
+    # Insere no topo da lista (mais recente primeiro)
+    registros.insert(0, novo_item)
+    
+    json_bytes = json.dumps(registros, ensure_ascii=False, indent=2).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype="application/json", resumable=False)
+    
+    drive_service.files().update(
+        fileId=arq_id,
         media_body=media,
-        fields="id, name"
+        supportsAllDrives=True
     ).execute()
-    return arquivo.get("name")
+    
+    return nome_referencia
 
 def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pac: str, campo_presc: str) -> bytes:
     """
@@ -280,7 +295,6 @@ def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pa
     pdf_bytes = carregar_pdf_template()
     writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
     
-    # Texto consolidado do campo CIDADÃO (Nome, CPF e Endereço)
     cabecalho_cidadao = (
         f"{dados_paciente['nome']} - CPF: {dados_paciente['cpf_formatado']}\n"
         f"{dados_paciente['endereco']}"
@@ -380,9 +394,8 @@ if aba_selecionada == "📝 Emitir Prescrição":
                 with st.spinner("Verificando histórico de prescrições no Google Drive..."):
                     historico_cpf = listar_prescricoes_drive(id_busca)
                     if historico_cpf:
-                        texto_previo = ler_texto_prescricao_drive(historico_cpf[0]["file_id"])
-                        st.session_state["texto_prescricao_atual"] = texto_previo
-                        st.session_state["data_ultima_presc"] = historico_cpf[0]["data_hora_str"]
+                        st.session_state["texto_prescricao_atual"] = historico_cpf[0].get("texto", "")
+                        st.session_state["data_ultima_presc"] = historico_cpf[0].get("data_hora_str", "")
                     else:
                         st.session_state["texto_prescricao_atual"] = ""
                         st.session_state["data_ultima_presc"] = None
@@ -404,7 +417,11 @@ if aba_selecionada == "📝 Emitir Prescrição":
                     st.warning("O campo de prescrição não pode estar vazio.")
                 else:
                     with st.spinner("Salvando histórico no Google Drive e preenchendo PDF..."):
-                        nome_txt_salvo = salvar_prescricao_drive(id_busca, texto_editado)
+                        try:
+                            nome_txt_salvo = salvar_prescricao_drive(id_busca, paciente["nome"], texto_editado)
+                            st.success(f"✅ Prescrição registrada no histórico (`{nome_txt_salvo}`) e PDF gerado!")
+                        except Exception as erro_drive:
+                            st.warning(f"⚠️ O PDF foi gerado, mas houve um aviso ao atualizar o histórico no Drive: {erro_drive}")
                         
                         pdf_final_bytes = preencher_pdf_template(
                             dados_paciente=paciente,
@@ -415,9 +432,8 @@ if aba_selecionada == "📝 Emitir Prescrição":
                         
                         st.session_state["texto_prescricao_atual"] = texto_editado
                         
-                    st.success(f"Prescrição registrada no histórico (`{nome_txt_salvo}`) e PDF gerado!")
-                    
-                    nome_pdf_download = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{datetime.now().strftime('%d-%m-%Y')}.pdf"
+                    agora_local = datetime.now(ZoneInfo("America/Sao_Paulo"))
+                    nome_pdf_download = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{agora_local.strftime('%d-%m-%Y')}.pdf"
                     
                     st.download_button(
                         label="⬇️ Baixar Arquivo PDF",
@@ -471,7 +487,7 @@ elif aba_selecionada == "🗂️ Histórico de Pacientes":
                             col_data.markdown(f"📅 **Data e Hora:** {item['data_hora_str']} (`{item['nome_arquivo']}`)")
                             
                             if col_acao.button("📄 Ver / Reimprimir", key=f"ver_{item['file_id']}"):
-                                texto_hist = ler_texto_prescricao_drive(item["file_id"])
+                                texto_hist = item.get("texto", "")
                                 st.text_area(
                                     f"Prescrição de {item['data_hora_str']}:",
                                     value=texto_hist,
