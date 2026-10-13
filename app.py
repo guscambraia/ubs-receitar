@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import re
 import io
@@ -8,25 +9,67 @@ import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, TextStringObject
+from pypdf.generic import (
+    NameObject,
+    TextStringObject,
+    DictionaryObject,
+    ArrayObject,
+    FloatObject,
+    DecodedStreamObject,
+    ByteStringObject,
+)
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # ==========================================
-# 1. CONFIGURAÇÃO DA PÁGINA E CAMPOS DO PDF
+# 1. CONFIGURAÇÃO DA PÁGINA E ESTILO VISUAL (A4 + FONTE LATO)
 # ==========================================
 st.set_page_config(
-    page_title="Sistema de Prescrições",
+    page_title="Sistema de Prescrições - UBS",
     page_icon="🩺",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
+
+# Carrega a fonte Lato no próprio Streamlit e estiliza a caixa de prescrição na proporção do PDF A4
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap');
+
+/* Aproveita o máximo da tela */
+.block-container {
+    padding-top: 1.2rem !important;
+    padding-bottom: 1rem !important;
+    max-width: 98% !important;
+}
+
+/* Estiliza o editor de prescrição para simular exatamente a caixa PRESCRIÇÃO na folha A4 */
+div[data-testid="stTextArea"] textarea {
+    font-family: 'Lato', sans-serif !important;
+    font-size: 15.2px !important; /* Equivalente a 11,41 pt em tela (96 DPI) */
+    line-height: 1.35 !important;
+    color: #000000 !important;
+    background-color: #ffffff !important;
+    border: 2px solid #cbd5e1 !important;
+    border-radius: 6px !important;
+    padding: 16px 20px !important;
+    box-shadow: inset 0 1px 4px rgba(0,0,0,0.06) !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 NOME_CAMPO_PACIENTE_PDF = "CIDADÃO"
 NOME_CAMPO_PRESCRICAO_PDF = "PRESCRIÇÃO"
 
 NOME_ARQUIVO_HISTORICO = "historico_prescricoes.json"
 ID_PADRAO_HISTORICO = "1RFtMetxdO2B8MioNsSC9SMi7MiUMCDC_"
+
+# Tamanhos de fonte desejados na escala de impressão A4:
+# (No template base 417x588 pt, o fator para A4 595.28x841.89 pt é 1.42625 -> 11.41 / 1.42625 = 8.0 pt e 8.56 / 1.42667 = 6.0 pt)
+FATOR_A4 = 11.41 / 8.0  # 1.42625
+TAMANHO_A4_PADRAO = 11.41
+TAMANHO_A4_DATA_HORA = 8.56
 
 MESES_PT = [
     "janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -194,7 +237,7 @@ def carregar_pdf_template() -> bytes:
     return baixar_arquivo_drive(pdf_id)
 
 # ==========================================
-# 4. FUNÇÕES DE NEGÓCIO (BUSCA, DRIVE E PDF)
+# 4. FUNÇÕES DE NEGÓCIO (BUSCA, DRIVE E MOTOR PDF LATO)
 # ==========================================
 def formatar_documento(doc_num: str) -> str:
     apenas_num = re.sub(r"\D", "", str(doc_num))
@@ -314,151 +357,472 @@ def salvar_prescricao_drive(identificador_limpo: str, nome_paciente: str, texto_
     
     return nome_referencia
 
-def otimizar_texto_prescricao(texto: str, compactar_automatico: bool = True) -> tuple[str, float]:
+# ==========================================
+# MOTOR DE MEDIÇÃO E DESENHO EM FONTE LATO
+# ==========================================
+@st.cache_data(ttl=3600)
+def obter_larguras_fonte_lato() -> list[float]:
+    """Extrai a tabela oficial de larguras (/Widths) da fonte Lato embutida no template.pdf."""
+    try:
+        pdf_bytes = carregar_pdf_template()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        acro = reader.trailer["/Root"]["/AcroForm"].get_object()
+        lato_obj = acro["/DR"]["/Font"]["/Lato"].get_object()
+        return [float(w) for w in lato_obj["/Widths"]]
+    except Exception:
+        return [500.0] * 256
+
+def largura_texto_lato_pt(texto: str, font_size_interno: float, widths: list[float]) -> float:
+    """Calcula a largura exata (em pontos PDF) de uma string na fonte Lato."""
+    b = texto.encode("cp1252", errors="replace")
+    soma = sum(widths[ch] for ch in b)
+    return (soma / 1000.0) * font_size_interno
+
+def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_interno: float, widths: list[float]) -> list[str]:
     """
-    1. Se 'compactar_automatico' estiver ativo e a receita tiver muitas linhas vazias,
-       remove linhas em branco duplicadas/triplas e encurta tracejados excessivos ('---')
-       para que a palavra 'CONT' ou a quantidade não quebre para a linha de baixo.
-    2. Calcula o tamanho exato da fonte Lato (máx. 8.0 pt, mín. 5.0 pt) para caber
-       nos 322 pontos de altura do campo PRESCRIÇÃO do template.pdf.
+    Quebra cada parágrafo do texto exatamente como o PDF fará dentro da largura da caixa,
+    garantindo que nenhuma palavra saia pelas bordas laterais.
     """
-    texto_proc = (texto or "").strip()
-    if not texto_proc:
-        return "", 8.0
+    linhas_finais = []
+    for linha_bruta in (texto or "").splitlines():
+        linha = linha_bruta.rstrip()
+        if not linha:
+            linhas_finais.append("")
+            continue
+        if largura_texto_lato_pt(linha, font_size_interno, widths) <= largura_max_pt:
+            linhas_finais.append(linha)
+            continue
+        # Se for uma linha com tracejado longo ("--- CONT"), reduz hifens primeiro para tentar manter na mesma linha
+        if "-----" in linha:
+            while "-----" in linha and largura_texto_lato_pt(linha, font_size_interno, widths) > largura_max_pt:
+                nova = re.sub(r"-{6,}", lambda m: m.group(0)[:-2], linha, count=1)
+                if nova == linha:
+                    break
+                linha = nova
+            if largura_texto_lato_pt(linha, font_size_interno, widths) <= largura_max_pt:
+                linhas_finais.append(linha)
+                continue
+        # Quebra palavra por palavra se ainda ultrapassar a largura
+        palavras = linha.split(" ")
+        atual = ""
+        for p in palavras:
+            teste = f"{atual} {p}".strip() if atual else p
+            if largura_texto_lato_pt(teste, font_size_interno, widths) <= largura_max_pt:
+                atual = teste
+            else:
+                if atual:
+                    linhas_finais.append(atual)
+                atual = p
+        if atual:
+            linhas_finais.append(atual)
+    return linhas_finais
 
-    # Encurta sequências de mais de 55 hifens para evitar quebra de linha desnecessária
-    def ajustar_tracos(linha: str) -> str:
-        if "-----" in linha and len(linha) > 90:
-            excesso = len(linha) - 88
-            return re.sub(r"-{" + str(excesso + 5) + r",}", lambda m: "-" * max(10, len(m.group(0)) - excesso), linha, count=1)
-        return linha
+def calcular_ajuste_prescricao(
+    texto: str,
+    largura_caixa_pt: float = 350.0,
+    altura_caixa_pt: float = 316.0,
+    escala_a4: float = FATOR_A4
+) -> tuple[list[str], float, float]:
+    """
+    Sempre busca o tamanho máximo 11,41 pt (na escala A4, equivalente a 8,00 pt na escala base do template).
+    Se todo o texto couber em 11,41 pt sem sobrar nada, mantém 11,41 pt.
+    Caso ultrapasse a altura da caixa PRESCRIÇÃO, reduz aos poucos (de 0,1 em 0,1 pt interno)
+    até encontrar o maior tamanho onde 100% das linhas cabem dentro do campo.
+    """
+    widths = obter_larguras_fonte_lato()
+    texto_limpo = (texto or "").strip()
+    if not texto_limpo:
+        return [""], 8.0, TAMANHO_A4_PADRAO
 
-    linhas_orig = [ajustar_tracos(l.rstrip()) for l in texto_proc.splitlines()]
-    texto_proc = "\n".join(linhas_orig)
+    tam_interno_max = TAMANHO_A4_PADRAO / escala_a4  # 8.00 pt no template 417x588 (ou 11.41 se o template for A4)
+    tam_interno_min = 4.2 / (escala_a4 / FATOR_A4)
 
-    if compactar_automatico and len(linhas_orig) > 26:
-        # 1º Nível: Colapsa 2 ou 3 linhas vazias seguidas em apenas 1 linha vazia,
-        # e junta a linha do medicamento ("1. ...") diretamente à sua posologia abaixo
-        texto_nivel1 = re.sub(r"\n\s*\n+", "\n\n", texto_proc)
-        texto_nivel1 = re.sub(
-            r"(^\s*(?:\d+\.|USO\s).+)\n\n+(?=\S)",
-            r"\1\n",
-            texto_nivel1,
-            flags=re.MULTILINE | re.IGNORECASE
-        )
-        linhas_n1 = texto_nivel1.splitlines()
+    # 1ª Tentativa: Com o texto exatamente como digitado, começando em 11,41 pt (A4) e reduzindo aos poucos
+    tam = tam_interno_max
+    while tam >= tam_interno_min:
+        linhas_quebradas = quebrar_linhas_para_caixa(texto_limpo, largura_caixa_pt, tam, widths)
+        espacamento_linha = tam * 1.32
+        altura_necessaria = len(linhas_quebradas) * espacamento_linha
+        if altura_necessaria <= altura_caixa_pt:
+            return linhas_quebradas, round(tam, 2), round(tam * escala_a4, 2)
+        tam -= 0.10
+
+    # 2ª Tentativa (Se o texto tiver dezenas de linhas em branco extras): compacta linhas vazias repetidas
+    texto_compacto = re.sub(r"\n\s*\n+", "\n\n", texto_limpo)
+    texto_compacto = re.sub(
+        r"(^\s*(?:\d+\.|USO\s).+)\n\n+(?=\S)",
+        r"\1\n",
+        texto_compacto,
+        flags=re.MULTILINE | re.IGNORECASE
+    )
+    tam = tam_interno_max
+    while tam >= 3.5:
+        linhas_quebradas = quebrar_linhas_para_caixa(texto_compacto, largura_caixa_pt, tam, widths)
+        espacamento_linha = tam * 1.28
+        altura_necessaria = len(linhas_quebradas) * espacamento_linha
+        if altura_necessaria <= altura_caixa_pt:
+            return linhas_quebradas, round(tam, 2), round(tam * escala_a4, 2)
+        tam -= 0.10
+
+    linhas_finais = quebrar_linhas_para_caixa(texto_compacto, largura_caixa_pt, 3.5, widths)
+    return linhas_finais, 3.5, round(3.5 * escala_a4, 2)
+
+def escapar_literal_pdf(texto: str) -> bytes:
+    """Converte string para bytes WinAnsiEncoding (cp1252) escapando parênteses e barras para fluxo PDF."""
+    b = texto.encode("cp1252", errors="replace")
+    b = b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+    return b
+
+def construir_ap_stream_lato(
+    linhas: list[str],
+    largura_rect: float,
+    altura_rect: float,
+    font_size: float,
+    centralizar: bool = False,
+    multilinha: bool = True,
+    widths: list[float] = None
+) -> bytes:
+    """
+    Gera o fluxo de aparência (/AP /N) nativo do PDF usando exclusivamente a fonte /Lato,
+    com posicionamento vertical e horizontal exatos.
+    """
+    if widths is None:
+        widths = obter_larguras_fonte_lato()
         
-        # Se ainda passar de 42 linhas, aplica o 2º nível (1 linha por item, separando apenas blocos de USO/OBS)
-        if len(linhas_n1) > 42:
-            nao_vazias = [l for l in linhas_n1 if l.strip()]
-            out_n2 = []
-            for idx, l in enumerate(nao_vazias):
-                if idx > 0 and re.match(r"^\s*(USO\s|OBS)", l, re.IGNORECASE):
-                    out_n2.append("")
-                out_n2.append(l)
-            texto_proc = "\n".join(out_n2)
-        else:
-            texto_proc = texto_nivel1
-
-    linhas_finais = texto_proc.splitlines()
-    # Conta quantas linhas visuais serão ocupadas considerando quebras horizontais (~85 cols)
-    total_linhas_visuais = sum(max(1, (len(l) // 85) + 1) for l in linhas_finais)
-    total_chars = len(texto_proc)
-
-    # Cálculo matemático para caber em 312 pt úteis de altura (espaçamento de 1.38 * font_size)
-    # font_size <= 312 / (1.38 * total_linhas_visuais)
-    if total_linhas_visuais <= 26 and total_chars <= 650:
-        tamanho = 8.0
+    leading = font_size * 1.32
+    if multilinha:
+        y_inicial = altura_rect - font_size - 2.0
     else:
-        tam_altura = 312.0 / (1.38 * max(1, total_linhas_visuais))
-        # Arredonda para múltiplos de 0.5 (ou 0.25) entre 5.0 e 8.0
-        tamanho = max(5.0, min(8.0, round(tam_altura * 2) / 2))
+        # Centraliza verticalmente em campos de 1 linha (DATA e DATA_HORA)
+        y_inicial = max(1.5, (altura_rect - font_size) / 2.0 + 1.0)
 
-    return texto_proc, tamanho
+    comandos = [
+        f"q\n/Tx BMC\nq\n1 1 {largura_rect - 2:.2f} {altura_rect - 2:.2f} re\nW\nn\nBT\n/Lato {font_size:.2f} Tf\n0 g".encode("ascii")
+    ]
+
+    y_atual = y_inicial
+    for idx, linha in enumerate(linhas):
+        if centralizar:
+            larg_txt = largura_texto_lato_pt(linha, font_size, widths)
+            x_pos = max(2.0, (largura_rect - larg_txt) / 2.0)
+        else:
+            x_pos = 2.0
+
+        if idx == 0:
+            comandos.append(f"{x_pos:.2f} {y_atual:.2f} Td".encode("ascii"))
+        else:
+            comandos.append(f"0 {-leading:.2f} Td".encode("ascii"))
+
+        comandos.append(b"(" + escapar_literal_pdf(linha) + b") Tj")
+
+    comandos.append(b"ET\nQ\nEMC\nQ\n")
+    return b"\n".join(comandos)
 
 def preencher_pdf_template(
     dados_paciente: dict,
     texto_prescricao: str,
-    campo_pac: str,
-    campo_presc: str,
-    compactar_automatico: bool = True
+    campo_pac: str = NOME_CAMPO_PACIENTE_PDF,
+    campo_presc: str = NOME_CAMPO_PRESCRICAO_PDF
 ) -> tuple[bytes, float]:
     """
-    Preenche o template.pdf:
-    - Remove qualquer JavaScript antigo do campo CIDADÃO para não sobrescrever o endereço com o CPF;
-    - Define a fonte Lato com tamanho dinâmico ANTES de gerar a aparência visual (/AP);
-    - Atualiza o JavaScript interno do PDF para manter o mesmo tamanho no Adobe Acrobat.
+    Preenche todos os 4 campos do template.pdf ('CIDADÃO', 'PRESCRIÇÃO', 'DATA', 'DATA_HORA')
+    garantindo que TODOS usem a fonte Lato embutida e aplicando os tamanhos exatos:
+    - CIDADÃO: Lato 11,41 pt (A4)
+    - DATA: Lato 11,41 pt (A4)
+    - DATA_HORA: Lato 8,56 pt (A4)
+    - PRESCRIÇÃO: Lato dinâmico iniciando em 11,41 pt (A4) e reduzindo apenas se necessário.
     """
     pdf_bytes = carregar_pdf_template()
     writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
-    
-    # Formatação exata do campo CIDADÃO:
-    # João da Silva - CPF: 000.000.000-00
-    # Rua das Flores, 123, Centro, Cidade - MG
+    widths = obter_larguras_fonte_lato()
+
+    pagina = writer.pages[0]
+    largura_pag = float(pagina.mediabox.width)
+    # Se a página do template tiver 417 pt de largura, o fator para A4 é 1.42625 (11.41 / 8.0).
+    # Se o template já estiver em A4 (595 pt), o fator é 1.0.
+    escala_a4 = FATOR_A4 if largura_pag < 500 else 1.0
+
+    tam_padrao_int = round(TAMANHO_A4_PADRAO / escala_a4, 2)      # 8.00 pt (equivale a 11,41 pt em A4)
+    tam_datahora_int = round(TAMANHO_A4_DATA_HORA / escala_a4, 2) # 6.00 pt (equivale a 8,56 pt em A4)
+
+    # 1. Monta o texto do CIDADÃO (Nome - CPF na 1ª linha, Endereço na 2ª linha)
     linha_1 = f"{dados_paciente['nome']} - CPF: {dados_paciente['cpf_formatado']}"
     endereco_val = limpar_endereco_esus(dados_paciente.get("endereco", ""))
-    cabecalho_cidadao = f"{linha_1}\n{endereco_val}" if endereco_val else linha_1
-    
-    # Otimiza quebras de linha excessivas e calcula tamanho ideal da fonte Lato (máx 8)
-    texto_final_presc, tamanho_lato = otimizar_texto_prescricao(texto_prescricao, compactar_automatico)
-    tamanho_str = str(int(tamanho_lato)) if tamanho_lato == int(tamanho_lato) else str(tamanho_lato)
-    
+    linhas_cidadao = [linha_1, endereco_val] if endereco_val else [linha_1]
+    texto_cidadao = "\n".join(linhas_cidadao)
+
+    # 2. Monta DATA e DATA_HORA
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
     texto_data = f"Divinópolis - MG, {agora.strftime('%d')} de {MESES_PT[agora.month - 1]} de {agora.year}"
     texto_data_hora = f"{agora.strftime('%d/%m/%Y')} às {agora.strftime('%H:%M')}"
-    
-    valores_campos = {
-        campo_pac: cabecalho_cidadao,
-        campo_presc: texto_final_presc,
-        "DATA": texto_data,
-        "DATA_HORA": texto_data_hora
+
+    # 3. Mede a caixa PRESCRIÇÃO real do PDF e calcula o tamanho dinâmico da fonte Lato (máx 11,41 pt A4)
+    larg_presc_box, alt_presc_box = 350.0, 316.0
+    if "/Annots" in pagina:
+        for annot_ref in pagina["/Annots"]:
+            annot = annot_ref.get_object()
+            if annot.get("/T") == campo_presc:
+                r = [float(x) for x in annot.get("/Rect")]
+                larg_presc_box = abs(r[2] - r[0]) - 5.0
+                alt_presc_box = abs(r[3] - r[1]) - 5.0
+                break
+
+    linhas_presc, tam_presc_int, tam_presc_a4 = calcular_ajuste_prescricao(
+        texto_prescricao,
+        largura_caixa_pt=larg_presc_box,
+        altura_caixa_pt=alt_presc_box,
+        escala_a4=escala_a4
+    )
+    texto_presc_final = "\n".join(linhas_presc)
+
+    # Obtém a referência da fonte /Lato do /AcroForm para injetar em todos os campos
+    acro_dr = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()
+    lato_font_ref = acro_dr["/Font"].get_object()["/Lato"]
+
+    config_campos = {
+        campo_pac: {
+            "valor": texto_cidadao,
+            "linhas": linhas_cidadao,
+            "size": tam_padrao_int,
+            "center": False,
+            "multiline": True
+        },
+        campo_presc: {
+            "valor": texto_presc_final,
+            "linhas": linhas_presc,
+            "size": tam_presc_int,
+            "center": False,
+            "multiline": True
+        },
+        "DATA": {
+            "valor": texto_data,
+            "linhas": [texto_data],
+            "size": tam_padrao_int,
+            "center": True,
+            "multiline": False
+        },
+        "DATA_HORA": {
+            "valor": texto_data_hora,
+            "linhas": [texto_data_hora],
+            "size": tam_datahora_int,
+            "center": False,
+            "multiline": False
+        }
     }
-    
-    # PASSO CRÍTICO 1: Atualiza /DA e limpa ações (/AA) ANTES de update_page_form_field_values
-    if "/AcroForm" in writer._root_object and "/Fields" in writer._root_object["/AcroForm"]:
-        for field_ref in writer._root_object["/AcroForm"]["/Fields"]:
-            field_obj = field_ref.get_object()
-            nome_f = field_obj.get("/T")
-            if nome_f == campo_pac:
-                field_obj[NameObject("/DA")] = TextStringObject("/Lato 8 Tf 0 g")
-                if "/AA" in field_obj:
-                    del field_obj["/AA"]
-            elif nome_f == campo_presc:
-                field_obj[NameObject("/DA")] = TextStringObject(f"/Lato {tamanho_str} Tf 0 g")
-                # Substitui o gatilho OnBlur (/Bl) do campo PRESCRIÇÃO para fixar o tamanho calculado
-                if "/AA" in field_obj:
-                    del field_obj["/AA"]
 
-    for pagina in writer.pages:
-        if "/Annots" in pagina:
-            for annot_ref in pagina["/Annots"]:
-                annot = annot_ref.get_object()
-                nome_campo = annot.get("/T")
-                if nome_campo == campo_pac:
-                    annot[NameObject("/DA")] = TextStringObject("/Lato 8 Tf 0 g")
-                    if "/AA" in annot:
-                        del annot["/AA"]
-                elif nome_campo == campo_presc:
-                    annot[NameObject("/DA")] = TextStringObject(f"/Lato {tamanho_str} Tf 0 g")
-                    if "/AA" in annot:
-                        del annot["/AA"]
-                        
-        # PASSO CRÍTICO 2: Agora gera o fluxo visual (/AP) já com a fonte Lato reduzida
-        writer.update_page_form_field_values(pagina, valores_campos)
+    # 4. Atualiza os campos no AcroForm e nas Anotações da página
+    for p in writer.pages:
+        if "/Annots" not in p:
+            continue
+        for annot_ref in p["/Annots"]:
+            annot = annot_ref.get_object()
+            nome_c = annot.get("/T")
+            if nome_c not in config_campos:
+                continue
 
-    # PASSO CRÍTICO 3: Remove scripts antigos do catálogo /Names que possam sobrescrever CIDADÃO ou PRESCRIÇÃO
+            cfg = config_campos[nome_c]
+            f_size = cfg["size"]
+
+            # Remove o /DR antigo (que tinha apenas /Helv = Arial em CIDADÃO e DATA) e força /Lato
+            annot[NameObject("/DR")] = DictionaryObject({
+                NameObject("/Font"): DictionaryObject({
+                    NameObject("/Lato"): lato_font_ref
+                })
+            })
+            annot[NameObject("/DA")] = TextStringObject(f"/Lato {f_size} Tf 0 g")
+            annot[NameObject("/V")] = TextStringObject(cfg["valor"])
+            if "/AA" in annot:
+                del annot["/AA"]
+
+            # Constrói o fluxo visual (/AP /N) cravado na fonte Lato
+            rect = [float(x) for x in annot.get("/Rect")]
+            w_box = abs(rect[2] - rect[0])
+            h_box = abs(rect[3] - rect[1])
+
+            stream_bytes = construir_ap_stream_lato(
+                linhas=cfg["linhas"],
+                largura_rect=w_box,
+                altura_rect=h_box,
+                font_size=f_size,
+                centralizar=cfg["center"],
+                multilinha=cfg["multiline"],
+                widths=widths
+            )
+
+            ap_stream_obj = DecodedStreamObject.initialize_from_dictionary({
+                NameObject("/Type"): NameObject("/XObject"),
+                NameObject("/Subtype"): NameObject("/Form"),
+                NameObject("/FormType"): 1,
+                NameObject("/BBox"): ArrayObject([FloatObject(0.0), FloatObject(0.0), FloatObject(w_box), FloatObject(h_box)]),
+                NameObject("/Resources"): DictionaryObject({
+                    NameObject("/Font"): DictionaryObject({
+                        NameObject("/Lato"): lato_font_ref
+                    })
+                }),
+                "__streamdata__": ByteStringObject(stream_bytes),
+                "/Length": 0
+            })
+
+            annot[NameObject("/AP")] = DictionaryObject({
+                NameObject("/N"): writer._add_object(ap_stream_obj)
+            })
+
+    # Desativa NeedAppearances para que o navegador e o Acrobat usem o desenho Lato exato que geramos
+    writer.set_need_appearances_writer(False)
+
+    # Remove scripts antigos para não sobrescreverem os campos na abertura
     if "/Names" in writer._root_object:
         names_obj = writer._root_object["/Names"].get_object()
         if "/JavaScript" in names_obj:
             del names_obj["/JavaScript"]
-            
+
     output_buffer = io.BytesIO()
     writer.write(output_buffer)
     output_buffer.seek(0)
-    return output_buffer.read(), tamanho_lato
+    return output_buffer.read(), tam_presc_a4
+
+def renderizar_visualizador_e_impressao_pdf(pdf_bytes: bytes, altura_px: int = 760):
+    """
+    Exibe o PDF na tela usando Blob URL + PDF.js (sem bloqueio do Chrome) e inclui
+    botão de Impressão Direta no navegador sem precisar salvar o arquivo antes.
+    """
+    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+        <style>
+            body {{
+                margin: 0;
+                padding: 0;
+                font-family: 'Lato', sans-serif;
+                background: #f1f5f9;
+            }}
+            .toolbar {{
+                display: flex;
+                gap: 10px;
+                padding: 10px 14px;
+                background: #1e293b;
+                color: white;
+                align-items: center;
+                justify-content: space-between;
+                border-radius: 8px 8px 0 0;
+            }}
+            .btn-print {{
+                background: #16a34a;
+                color: white;
+                border: none;
+                padding: 9px 18px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 6px;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            }}
+            .btn-print:hover {{
+                background: #15803d;
+            }}
+            .btn-open {{
+                background: #3b82f6;
+                color: white;
+                border: none;
+                padding: 9px 14px;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 6px;
+                cursor: pointer;
+            }}
+            #canvas-container {{
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding: 14px;
+                overflow-y: auto;
+                max-height: {altura_px - 65}px;
+            }}
+            canvas {{
+                box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+                border-radius: 4px;
+                background: white;
+                max-width: 100%;
+                height: auto !important;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <span>📄 <b>Visualização A4 (Fonte Lato)</b></span>
+            <div>
+                <button class="btn-print" onclick="imprimirDireto()">🖨️ IMPRIMIR DIRETO AGORA</button>
+                <button class="btn-open" onclick="abrirNovaAba()">↗️ Abrir em Nova Aba</button>
+            </div>
+        </div>
+        <div id="canvas-container">
+            <canvas id="pdf-canvas"></canvas>
+        </div>
+        <iframe id="print-iframe" style="display:none;"></iframe>
+
+        <script>
+            const b64Data = "{b64_pdf}";
+            const byteCharacters = atob(b64Data);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {{
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }}
+            const byteArray = new Uint8Array(byteNumbers);
+            const pdfBlob = new Blob([byteArray], {{ type: 'application/pdf' }});
+            const blobUrl = URL.createObjectURL(pdfBlob);
+
+            // Carrega no iframe oculto para impressão direta com 1 clique
+            const printFrame = document.getElementById('print-iframe');
+            printFrame.src = blobUrl;
+
+            function imprimirDireto() {{
+                try {{
+                    printFrame.contentWindow.focus();
+                    printFrame.contentWindow.print();
+                }} catch (e) {{
+                    const win = window.open(blobUrl, '_blank');
+                    if (win) win. focus();
+                }}
+            }}
+
+            function abrirNovaAba() {{
+                window.open(blobUrl, '_blank');
+            }}
+
+            // Renderiza a página do PDF no Canvas com nitidez alta (escala 2x) usando PDF.js
+            const pdfjsLib = window['pdfjs-dist/build/pdf'];
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+            pdfjsLib.getDocument({{ data: byteArray }}).promise.then(function(pdf) {{
+                pdf.getPage(1).then(function(page) {{
+                    const scale = 2.0;
+                    const viewport = page.getViewport({{ scale: scale }});
+                    const canvas = document.getElementById('pdf-canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+
+                    page.render({{
+                        canvasContext: context,
+                        viewport: viewport
+                    }});
+                }});
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    components.html(html_code, height=altura_px, scrolling=False)
 
 # ==========================================
-# 5. MENU LATERAL E CONFIGURAÇÕES
+# 5. MENU LATERAL
 # ==========================================
 with st.sidebar:
     st.header("🩺 Menu Principal")
@@ -466,163 +830,146 @@ with st.sidebar:
         "Navegação:",
         ["📝 Emitir Prescrição", "🗂️ Histórico de Pacientes"]
     )
-    
     st.divider()
-    compactar_auto = st.checkbox(
-        "Compactar linhas em branco extras automaticamente em prescrições grandes",
-        value=True,
-        help="Remove espaços duplos/triplos entre medicamentos quando a receita for longa para que nenhum item fique cortado."
-    )
-    
-    with st.expander("⚙️ Conferência de Campos e Base"):
+    with st.expander("⚙️ Conferência da Base"):
         try:
             df_teste = carregar_base_pacientes()
-            st.caption(f"Pacientes carregados no CSV: **{len(df_teste)}**")
+            st.caption(f"Pacientes no CSV: **{len(df_teste)}**")
         except Exception as e_csv:
             st.error(f"Erro no CSV: {e_csv}")
-            
-        try:
-            pdf_temp = carregar_pdf_template()
-            reader_temp = PdfReader(io.BytesIO(pdf_temp))
-            campos_detectados = list((reader_temp.get_fields() or {}).keys())
-            st.caption(f"Campos detectados no PDF: `{campos_detectados}`")
-        except Exception:
-            campos_detectados = []
-            
         campo_pac_input = st.text_input("Campo Cidadão:", value=NOME_CAMPO_PACIENTE_PDF)
         campo_presc_input = st.text_input("Campo Prescrição:", value=NOME_CAMPO_PRESCRICAO_PDF)
-        
+
     if st.button("🔄 Recarregar CSV / Template do Drive", use_container_width=True):
         st.cache_data.clear()
-        st.success("Cache atualizado com sucesso!")
-        
+        st.success("Cache atualizado!")
     if st.button("🚪 Sair", use_container_width=True):
         st.session_state["autenticado"] = False
         st.rerun()
 
 # ==========================================
-# 6. TELA 1: EMITIR PRESCRIÇÃO
+# 6. TELA 1: EMITIR PRESCRIÇÃO (TELA CHEIA A4 + PREVIEW AO VIVO)
 # ==========================================
 if aba_selecionada == "📝 Emitir Prescrição":
-    st.title("📝 Emissão de Prescrição")
+    # Topo compacto para identificar ou selecionar o paciente
+    col_input_pec, col_dados_pac = st.columns([1, 1.3], gap="medium")
     
-    texto_pec = st.text_area(
-        "1. Cole aqui o texto bruto do paciente copiado do PEC (e-SUS) ou digite Nome/CPF:",
-        height=110,
-        placeholder="Cole o bloco de texto do prontuário contendo o CPF ou o Nome do paciente..."
-    )
-    
-    if texto_pec:
-        with st.spinner("Cruzando dados com a base de pacientes do e-SUS..."):
-            candidatos = buscar_paciente_no_texto_pec(texto_pec)
-            
-        if not candidatos:
-            st.error("❌ Nenhum paciente correspondente foi encontrado no arquivo 'pacientes.csv'.")
-        else:
+    with col_input_pec:
+        texto_pec = st.text_area(
+            "📋 1. Cole o texto do PEC (e-SUS) ou digite Nome / CPF do paciente:",
+            height=95,
+            placeholder="Cole aqui os dados do prontuário ou digite o Nome/CPF..."
+        )
+
+    candidatos = buscar_paciente_no_texto_pec(texto_pec) if texto_pec else []
+
+    if texto_pec and not candidatos:
+        st.error("❌ Nenhum paciente encontrado no arquivo 'pacientes.csv' com esses dados.")
+    elif candidatos:
+        with col_dados_pac:
             if len(candidatos) > 1:
-                opcoes = {f"{p['nome']} (CPF: {p['cpf_formatado']})": p for p in candidatos}
-                escolha = st.selectbox("Mais de um paciente encontrado. Selecione:", list(opcoes.keys()))
+                opcoes = {f"{p['nome']} — CPF: {p['cpf_formatado']}": p for p in candidatos}
+                escolha = st.selectbox("👥 Selecione o paciente:", list(opcoes.keys()))
                 paciente = opcoes[escolha]
             else:
                 paciente = candidatos[0]
-                
-            st.success("✅ Paciente localizado na base de dados!")
-            
+
+            id_busca = paciente["cpf_limpo"]
+
+            # Recarrega automaticamente a prescrição sempre que o paciente selecionado mudar
+            if st.session_state.get("paciente_ativo_id") != id_busca:
+                historico_cpf = listar_prescricoes_drive(id_busca)
+                if historico_cpf:
+                    texto_inicial = historico_cpf[0].get("texto", "")
+                    st.session_state["data_ultima_presc"] = historico_cpf[0].get("data_hora_str", "")
+                else:
+                    texto_inicial = ""
+                    st.session_state["data_ultima_presc"] = None
+                st.session_state[f"editor_presc_{id_busca}"] = texto_inicial
+                st.session_state["paciente_ativo_id"] = id_busca
+
             with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 1, 1])
-                c1.markdown(f"**Nome Completo:** {paciente['nome']}")
-                c2.markdown(f"**CPF:** {paciente['cpf_formatado']}")
-                if paciente.get("nascimento"):
-                    c3.markdown(f"**Nascimento:** {paciente['nascimento']}")
-                
+                st.markdown(f"**Cidadão:** `{paciente['nome']} - CPF: {paciente['cpf_formatado']}`")
                 endereco_editavel = st.text_input(
-                    "📍 Endereço (extraído do CSV para sair na 2ª linha do campo CIDADÃO):",
+                    "📍 Endereço (2ª linha do campo CIDADÃO):",
                     value=paciente["endereco"],
-                    key=f"end_{paciente['cpf_limpo']}",
-                    placeholder="Rua, Número, Complemento, Bairro, Cidade - MG"
+                    key=f"end_{id_busca}",
+                    label_visibility="collapsed",
+                    placeholder="Rua, Número, Bairro, Cidade - MG"
                 )
                 paciente["endereco"] = endereco_editavel.strip()
-                
-                st.caption(
-                    f"**Prévia no campo CIDADÃO do PDF:**  \n"
-                    f"`{paciente['nome']} - CPF: {paciente['cpf_formatado']}`  \n"
-                    f"`{paciente['endereco'] if paciente['endereco'] else '(Sem endereço cadastrado no CSV)'}`"
-                )
-            
-            id_busca = paciente["cpf_limpo"]
-            
-            if "ultimo_id_buscado" not in st.session_state or st.session_state["ultimo_id_buscado"] != id_busca:
-                with st.spinner("Verificando histórico de prescrições no Google Drive..."):
-                    historico_cpf = listar_prescricoes_drive(id_busca)
-                    if historico_cpf:
-                        st.session_state["texto_prescricao_atual"] = historico_cpf[0].get("texto", "")
-                        st.session_state["data_ultima_presc"] = historico_cpf[0].get("data_hora_str", "")
-                    else:
-                        st.session_state["texto_prescricao_atual"] = ""
-                        st.session_state["data_ultima_presc"] = None
-                    st.session_state["ultimo_id_buscado"] = id_busca
-            
+
+        st.divider()
+
+        # Área principal aproveitando o máximo da tela: Editor A4 à esquerda e Folha PDF ao vivo à direita
+        col_editor, col_preview = st.columns([1.05, 0.95], gap="large")
+
+        with col_editor:
             if st.session_state.get("data_ultima_presc"):
-                st.info(f"🔄 Prescrição anterior encontrada (emitida em **{st.session_state['data_ultima_presc']}**). O texto foi carregado automaticamente abaixo para edição opcional.")
+                st.caption(f"🔄 Histórico carregado automaticamente da última receita (**{st.session_state['data_ultima_presc']}**)")
             else:
-                st.info("✨ Primeira prescrição deste paciente no sistema. Digite os itens abaixo.")
-            
+                st.caption("✨ Paciente sem receita anterior no Drive — iniciando prescrição em branco")
+
+            # Chave vinculada ao CPF (f"editor_presc_{id_busca}") garante recarregamento imediato ao trocar de paciente
             texto_editado = st.text_area(
-                "2. Prescrição (edite como desejar):",
-                value=st.session_state.get("texto_prescricao_atual", ""),
-                height=260
+                "💊 2. Campo PRESCRIÇÃO (Proporção real da folha A4 em fonte Lato):",
+                key=f"editor_presc_{id_busca}",
+                height=620
             )
-            
-            texto_otimizado_previa, tam_previsto = otimizar_texto_prescricao(texto_editado, compactar_auto)
-            st.caption(
-                f"🔤 Fonte **Lato** calculada automaticamente: **{tam_previsto} pt** (Máx: 8 pt) | "
-                f"Linhas no PDF: **{len(texto_otimizado_previa.splitlines())}**"
+
+            # Calcula ao vivo o tamanho da fonte Lato (Máx 11,41 pt)
+            linhas_calc, _, tam_lato_a4 = calcular_ajuste_prescricao(texto_editado)
+            cor_badge = "green" if tam_lato_a4 >= 11.4 else "orange"
+            st.markdown(
+                f"🔤 Fonte **Lato** aplicada automaticamente no PDF: "
+                f":{cor_badge}[**{str(tam_lato_a4).replace('.', ',')} pt**] *(Máximo: 11,41 pt)* — "
+                f"Total de linhas no quadro: **{len(linhas_calc)}**"
             )
-            
-            if st.button("🖨️ Gerar Prescrição, Salvar no Drive e Imprimir", type="primary"):
-                if not texto_editado.strip():
-                    st.warning("O campo de prescrição não pode estar vazio.")
-                else:
-                    with st.spinner("Salvando histórico no Google Drive e preenchendo PDF..."):
-                        try:
-                            nome_txt_salvo = salvar_prescricao_drive(id_busca, paciente["nome"], texto_otimizado_previa)
-                            st.success(f"✅ Prescrição registrada no histórico (`{nome_txt_salvo}`) e PDF gerado!")
-                        except Exception as erro_drive:
-                            st.warning(f"⚠️ O PDF foi gerado, mas houve um aviso ao atualizar o histórico no Drive: {erro_drive}")
-                        
-                        pdf_final_bytes, _ = preencher_pdf_template(
-                            dados_paciente=paciente,
-                            texto_prescricao=texto_editado,
-                            campo_pac=campo_pac_input,
-                            campo_presc=campo_presc_input,
-                            compactar_automatico=compactar_auto
-                        )
-                        
-                        st.session_state["texto_prescricao_atual"] = texto_otimizado_previa
-                        
-                    agora_local = datetime.now(ZoneInfo("America/Sao_Paulo"))
-                    nome_pdf_download = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{agora_local.strftime('%d-%m-%Y')}.pdf"
-                    
-                    st.download_button(
-                        label="⬇️ Baixar Arquivo PDF",
-                        data=pdf_final_bytes,
-                        file_name=nome_pdf_download,
-                        mime="application/pdf",
-                        type="primary"
-                    )
-                    
-                    st.subheader("Visualização para Impressão")
-                    b64_pdf = base64.b64encode(pdf_final_bytes).decode("utf-8")
-                    iframe_html = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="750" type="application/pdf"></iframe>'
-                    st.markdown(iframe_html, unsafe_allow_html=True)
+
+            col_btn_salvar, col_btn_dl = st.columns([1.3, 1])
+            with col_btn_salvar:
+                salvar_clicado = st.button(
+                    "💾 Salvar no Histórico do Google Drive",
+                    type="primary",
+                    use_container_width=True
+                )
+
+        # Gera o PDF em memória em tempo real para visualização imediata e impressão sem precisar salvar antes
+        pdf_preview_bytes, _ = preencher_pdf_template(
+            dados_paciente=paciente,
+            texto_prescricao=texto_editado,
+            campo_pac=campo_pac_input,
+            campo_presc=campo_presc_input
+        )
+
+        if salvar_clicado:
+            if not texto_editado.strip():
+                st.warning("Digite a prescrição antes de salvar no histórico.")
+            else:
+                with st.spinner("Gravando prescrição no histórico do Google Drive..."):
+                    nome_salvo = salvar_prescricao_drive(id_busca, paciente["nome"], "\n".join(linhas_calc))
+                    st.session_state["data_ultima_presc"] = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y às %H:%M")
+                st.success(f"✅ Prescrição salva no Google Drive (`{nome_salvo}`)!")
+
+        with col_btn_dl:
+            agora_local = datetime.now(ZoneInfo("America/Sao_Paulo"))
+            nome_pdf_dl = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{agora_local.strftime('%d-%m-%Y')}.pdf"
+            st.download_button(
+                label="⬇️ Baixar PDF (Opcional)",
+                data=pdf_preview_bytes,
+                file_name=nome_pdf_dl,
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+        with col_preview:
+            renderizar_visualizador_e_impressao_pdf(pdf_preview_bytes, altura_px=740)
 
 # ==========================================
 # 7. TELA 2: HISTÓRICO E BUSCA POR PACIENTE
 # ==========================================
 elif aba_selecionada == "🗂️ Histórico de Pacientes":
     st.title("🗂️ Histórico de Prescrições Emitidas")
-    st.write("Pesquise pelo **Nome** ou **CPF** do paciente para consultar todas as receitas já emitidas e suas respectivas datas.")
-    
     termo_busca = st.text_input("🔍 Digite o Nome ou CPF do paciente:")
     
     if termo_busca:
@@ -650,31 +997,16 @@ elif aba_selecionada == "🗂️ Histórico de Pacientes":
                     if not prescricoes_pac:
                         st.caption("Nenhuma prescrição emitida para este paciente até o momento.")
                     else:
-                        st.markdown(f"**Total de prescrições encontradas:** {len(prescricoes_pac)}")
                         for item in prescricoes_pac:
                             col_data, col_acao = st.columns([3, 1])
                             col_data.markdown(f"📅 **Data e Hora:** {item['data_hora_str']} (`{item['nome_arquivo']}`)")
                             
-                            if col_acao.button("📄 Ver / Reimprimir", key=f"ver_{item['file_id']}"):
+                            if col_acao.button("📄 Visualizar / Imprimir", key=f"ver_{item['file_id']}"):
                                 texto_hist = item.get("texto", "")
-                                st.text_area(
-                                    f"Prescrição de {item['data_hora_str']}:",
-                                    value=texto_hist,
-                                    height=180,
-                                    disabled=True,
-                                    key=f"txt_{item['file_id']}"
-                                )
-                                pdf_reimpressao, _ = preencher_pdf_template(
+                                pdf_reimp, _ = preencher_pdf_template(
                                     dados_paciente=dados_pac,
                                     texto_prescricao=texto_hist,
                                     campo_pac=campo_pac_input,
-                                    campo_presc=campo_presc_input,
-                                    compactar_automatico=compactar_auto
+                                    campo_presc=campo_presc_input
                                 )
-                                st.download_button(
-                                    label="⬇️ Baixar PDF desta data",
-                                    data=pdf_reimpressao,
-                                    file_name=f"Prescricao_{nome_pac.replace(' ', '_')}_{item['nome_arquivo'].replace('.txt', '.pdf')}",
-                                    mime="application/pdf",
-                                    key=f"dl_{item['file_id']}"
-                                )
+                                renderizar_visualizador_e_impressao_pdf(pdf_reimp, altura_px=680)
