@@ -93,7 +93,7 @@ if not st.session_state["autenticado"]:
     st.stop()
 
 # ==========================================
-# 3. CONEXÃO COM O GOOGLE DRIVE PRIVADO
+# 3. CONEXÃO COM O GOOGLE DRIVE
 # ==========================================
 @st.cache_resource
 def conectar_drive():
@@ -158,7 +158,6 @@ def carregar_base_pacientes() -> pd.DataFrame:
             break
             
     texto_tabela = "\n".join(linhas[indice_cabecalho:])
-    
     df = pd.read_csv(io.StringIO(texto_tabela), sep=";", dtype=str, on_bad_lines="skip", index_col=False)
     
     col_map = {remover_acentos(c): c for c in df.columns}
@@ -236,7 +235,6 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
     df = carregar_base_pacientes()
     if df.empty: return []
         
-    # Regex robusto para buscar CPF (com ou sem pontuação) evitando pegar números fora de contexto
     cpfs_encontrados = re.findall(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", texto_pec)
     for cpf_str in cpfs_encontrados:
         num = re.sub(r"\D", "", cpf_str)
@@ -264,17 +262,15 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
     return []
 
 def extrair_dados_brutos_avulsos(texto: str) -> dict:
-    """Extrai os dados brutos de pacientes que não estão no CSV."""
+    """Extrai Nome, CPF, Nascimento e Endereço de textos empilhados na vertical ou copiados do e-SUS."""
     texto_limpo = (texto or "").strip()
+    linhas = texto_limpo.splitlines()
     
-    # 1. Tenta extrair CPF ou CNS
+    # 1. Tenta extrair CPF
     cpf = ""
     cpf_match = re.search(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", texto_limpo)
     if cpf_match:
         cpf = re.sub(r"\D", "", cpf_match.group())
-    else:
-        cns_match = re.search(r"\b\d{15}\b", re.sub(r"[.\-]", "", texto_limpo))
-        if cns_match: cpf = cns_match.group()
 
     # 2. Tenta extrair Nascimento
     nascimento = ""
@@ -282,20 +278,51 @@ def extrair_dados_brutos_avulsos(texto: str) -> dict:
     if nasc_match:
         nascimento = nasc_match.group(1)
 
-    # 3. Tenta extrair Nome (Limpando barras, parentescos e gêneros)
+    # 3. Tenta extrair Nome (1ª linha antes da barra '|')
     nome = ""
-    linhas = texto_limpo.splitlines()
     if linhas:
         primeira_linha = linhas[0].strip()
-        # Se for "Belmarques Rodrigues | Sexo Masculino", corta no "|"
         parte_nome = re.split(r"\||\-|–|Sexo|Idade|Nasceu", primeira_linha, flags=re.IGNORECASE)[0].strip()
         if len(parte_nome) > 5 and not re.search(r"\d", parte_nome) and "CPF" not in parte_nome.upper():
             nome = parte_nome
 
-    # 4. Tenta extrair Endereço
+    # 4. Construção Avançada do Endereço (Radar Vertical)
     end = ""
-    m_end = re.search(r"(?:Endereço|Endereco|Residência|Logradouro|CEP)[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\s\,\.\-\|]{10,})(?:\n|\r|$)", texto_limpo, re.IGNORECASE)
-    if m_end: end = m_end.group(1).strip()
+    if "Logradouro" in texto_limpo or "CEP" in texto_limpo or "Município" in texto_limpo:
+        parsed_end = {}
+        for i, l in enumerate(linhas):
+            chave = l.strip().lower()
+            if i + 1 < len(linhas):
+                val = linhas[i+1].strip()
+                if chave == "tipo de logradouro": parsed_end["tipo"] = val
+                elif chave == "logradouro": parsed_end["rua"] = val
+                elif chave in ["número", "numero"]: parsed_end["num"] = val
+                elif chave == "bairro": parsed_end["bairro"] = val
+                elif chave in ["município", "municipio"]: parsed_end["cidade"] = val
+                elif chave == "estado": parsed_end["estado"] = val
+        
+        if "rua" in parsed_end:
+            tipo = parsed_end.get("tipo", "Rua")
+            rua = parsed_end.get("rua", "")
+            num = parsed_end.get("num", "S/N")
+            bairro = parsed_end.get("bairro", "")
+            cidade = parsed_end.get("cidade", "")
+            estado = parsed_end.get("estado", "")
+            
+            estados_map = {"Minas Gerais": "MG", "São Paulo": "SP", "Rio de Janeiro": "RJ", "Espírito Santo": "ES"}
+            estado = estados_map.get(estado, estado)
+
+            partes = []
+            if rua: partes.append(f"{tipo} {rua}, {num}".strip())
+            if bairro: partes.append(bairro)
+            base = ", ".join(partes)
+            
+            end = f"{base}, {cidade} - {estado}" if estado and cidade else f"{base}, {cidade}" if cidade else base
+
+    # Fallback se não for formato vertical
+    if not end:
+        m_end = re.search(r"(?:Endereço|Endereco|Residência|Logradouro|CEP)[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\s\,\.\-\|]{10,})(?:\n|\r|$)", texto_limpo, re.IGNORECASE)
+        if m_end: end = limpar_endereco_esus(m_end.group(1).strip())
 
     return {
         "nome": remover_acentos(nome),
@@ -446,7 +473,7 @@ def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pa
     tam_datahora_int = round(TAMANHO_A4_DATA_HORA / escala_a4, 2)
 
     linha_1 = f"{dados_paciente['nome']} - CPF: {dados_paciente['cpf_formatado']}"
-    endereco_val = limpar_endereco_esus(dados_paciente.get("endereco", ""))
+    endereco_val = dados_paciente.get("endereco", "")
     texto_cidadao = f"{linha_1}\n{endereco_val}" if endereco_val else linha_1
 
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
@@ -462,7 +489,9 @@ def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pa
                 break
 
     linhas_presc, tam_presc_int, tam_presc_a4 = calcular_ajuste_prescricao(texto_prescricao, larg_presc_box, alt_presc_box, escala_a4)
-    lato_font_ref = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()["/Font"].get_object()["/Lato"]
+
+    acro_dr = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()
+    lato_font_ref = acro_dr["/Font"].get_object()["/Lato"]
 
     config_campos = {
         campo_pac: {"valor": texto_cidadao, "linhas": texto_cidadao.splitlines(), "size": tam_padrao_int, "center": False, "multiline": True},
@@ -608,7 +637,7 @@ if aba_selecionada == "📝 Emitir Prescrição":
             
             # --- LÓGICA DE CADASTRO AVULSO ---
             if not candidatos:
-                st.warning("⚠️ Paciente não encontrado no CSV. **Cadastro Avulso:**")
+                st.warning("⚠️ Paciente não encontrado no CSV. **Cadastro Avulso Automático:**")
                 dados_ext = extrair_dados_brutos_avulsos(texto_pec)
                 
                 c_nome, c_cpf, c_nasc = st.columns([2, 1, 1])
