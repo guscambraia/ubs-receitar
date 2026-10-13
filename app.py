@@ -45,7 +45,7 @@ st.markdown("""
 
 div[data-testid="stTextArea"] textarea {
     font-family: 'Lato', sans-serif !important;
-    font-size: 15.2px !important;
+    font-size: 15.2px !important; 
     line-height: 1.35 !important;
     color: #000000 !important;
     background-color: #ffffff !important;
@@ -59,6 +59,7 @@ div[data-testid="stTextArea"] textarea {
 
 NOME_CAMPO_PACIENTE_PDF = "CIDADÃO"
 NOME_CAMPO_PRESCRICAO_PDF = "PRESCRIÇÃO"
+
 NOME_ARQUIVO_HISTORICO = "historico_prescricoes.json"
 ID_PADRAO_HISTORICO = "1RFtMetxdO2B8MioNsSC9SMi7MiUMCDC_"
 
@@ -92,7 +93,7 @@ if not st.session_state["autenticado"]:
     st.stop()
 
 # ==========================================
-# 3. CONEXÃO COM O GOOGLE DRIVE
+# 3. CONEXÃO COM O GOOGLE DRIVE PRIVADO
 # ==========================================
 @st.cache_resource
 def conectar_drive():
@@ -115,20 +116,16 @@ def baixar_arquivo_drive(file_id: str) -> bytes:
     return buffer.read()
 
 def remover_acentos(texto: str) -> str:
-    if not texto:
-        return ""
+    if not texto: return ""
     nfkd = unicodedata.normalize("NFKD", str(texto))
     sem_acento = "".join([c for c in nfkd if not unicodedata.combining(c)])
     return re.sub(r"\s+", " ", sem_acento).strip().upper()
 
 def limpar_endereco_esus(end_bruto: str) -> str:
-    if not end_bruto:
-        return ""
+    if not end_bruto: return ""
     texto = str(end_bruto).strip()
-    if texto.lower() in ["", "-", "nan", "none", "nao informada", "nao informado"]:
-        return ""
-    if re.match(r"^CPF\s*:", texto, flags=re.IGNORECASE):
-        return ""
+    if texto.lower() in ["", "-", "nan", "none", "nao informada", "nao informado"]: return ""
+    if re.match(r"^CPF\s*:", texto, flags=re.IGNORECASE): return ""
     texto = texto.split("|")[0].strip()
     texto = re.sub(r",\s*(\d+|S/N)\.\s*", r", \1, ", texto, flags=re.IGNORECASE)
     partes_hifen = texto.split(" - ")
@@ -146,8 +143,7 @@ def carregar_base_pacientes() -> pd.DataFrame:
         try:
             texto_decodificado = conteudo_bytes.decode(enc)
             break
-        except UnicodeDecodeError:
-            continue
+        except UnicodeDecodeError: continue
             
     if texto_decodificado is None:
         texto_decodificado = conteudo_bytes.decode("latin1", errors="replace")
@@ -163,16 +159,9 @@ def carregar_base_pacientes() -> pd.DataFrame:
             
     texto_tabela = "\n".join(linhas[indice_cabecalho:])
     
-    df = pd.read_csv(
-        io.StringIO(texto_tabela),
-        sep=";",
-        dtype=str,
-        on_bad_lines="skip",
-        index_col=False
-    )
+    df = pd.read_csv(io.StringIO(texto_tabela), sep=";", dtype=str, on_bad_lines="skip", index_col=False)
     
     col_map = {remover_acentos(c): c for c in df.columns}
-    
     col_cpf = col_map.get("CPF/CNS") or col_map.get("CPF")
     col_nome = col_map.get("NOME")
     col_end = col_map.get("ENDERECO")
@@ -203,18 +192,14 @@ def carregar_base_pacientes() -> pd.DataFrame:
             cid_v = str(row.get(col_cid, "")).strip() if col_cid else ""
             uf_v = str(row.get(col_uf, "")).strip() if col_uf else ""
             
-            if rua_v and rua_v not in ["-", "nan"]:
-                partes.append(f"{rua_v}, {num_v}" if (num_v and num_v not in ["-", "nan"]) else rua_v)
-            if comp_v and comp_v not in ["-", "nan"]:
-                partes.append(comp_v)
-            if bairro_v and bairro_v not in ["-", "nan"]:
-                partes.append(bairro_v)
+            if rua_v and rua_v not in ["-", "nan"]: partes.append(f"{rua_v}, {num_v}" if (num_v and num_v not in ["-", "nan"]) else rua_v)
+            if comp_v and comp_v not in ["-", "nan"]: partes.append(comp_v)
+            if bairro_v and bairro_v not in ["-", "nan"]: partes.append(bairro_v)
             base_e = ", ".join(partes)
             if cid_v and cid_v not in ["-", "nan"]:
                 cid_uf = f"{cid_v} - {uf_v}" if (uf_v and uf_v not in ["-", "nan"]) else cid_v
                 end_str = f"{base_e}, {cid_uf}" if base_e else cid_uf
-            else:
-                end_str = base_e
+            else: end_str = base_e
         enderecos_finais.append(end_str)
         
     df["endereco_limpo"] = enderecos_finais
@@ -227,7 +212,7 @@ def carregar_pdf_template() -> bytes:
     return baixar_arquivo_drive(pdf_id)
 
 # ==========================================
-# 4. FUNÇÕES DE NEGÓCIO E EXTRAÇÃO DE DADOS
+# 4. FUNÇÕES DE NEGÓCIO E EXTRAÇÃO AVULSA
 # ==========================================
 def formatar_documento(doc_num: str) -> str:
     apenas_num = re.sub(r"\D", "", str(doc_num))
@@ -239,7 +224,6 @@ def extrair_dados_linha(linha: pd.Series) -> dict:
     nome = str(linha.get("nome_limpo", "")).strip()
     doc_limpo = str(linha.get("doc_limpo", "")).strip()
     endereco = str(linha.get("endereco_limpo", "")).strip()
-    
     return {
         "nome": nome,
         "cpf_limpo": doc_limpo if doc_limpo else remover_acentos(nome).replace(" ", "_"),
@@ -250,10 +234,10 @@ def extrair_dados_linha(linha: pd.Series) -> dict:
 
 def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
     df = carregar_base_pacientes()
-    if df.empty:
-        return []
+    if df.empty: return []
         
-    cpfs_encontrados = re.findall(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", texto_pec)
+    # Regex robusto para buscar CPF (com ou sem pontuação) evitando pegar números fora de contexto
+    cpfs_encontrados = re.findall(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", texto_pec)
     for cpf_str in cpfs_encontrados:
         num = re.sub(r"\D", "", cpf_str)
         achados = df[df["doc_limpo"] == num]
@@ -279,49 +263,54 @@ def buscar_paciente_no_texto_pec(texto_pec: str) -> list:
                 return [extrair_dados_linha(row) for _, row in achados_parcial.head(15).iterrows()]
     return []
 
-def extrair_dados_brutos_avulsos(texto: str) -> tuple[str, str, str]:
-    """Tenta extrair Nome, CPF e Endereço de um texto bruto genérico quando o paciente não está na base."""
+def extrair_dados_brutos_avulsos(texto: str) -> dict:
+    """Extrai os dados brutos de pacientes que não estão no CSV."""
     texto_limpo = (texto or "").strip()
     
-    # 1. Extrair CPF
-    cpf_match = re.search(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", texto_limpo)
-    cpf = re.sub(r"\D", "", cpf_match.group()) if cpf_match else ""
-    
-    # 2. Extrair Nome
-    nome = ""
-    m_nome = re.search(r"(?:Nome|Paciente|Cidadão|Cidadao)[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ\s]{5,60})(?:\n|\r|$|CPF|Mãe|Data)", texto_limpo, re.IGNORECASE)
-    if m_nome:
-        nome = m_nome.group(1).strip()
+    # 1. Tenta extrair CPF ou CNS
+    cpf = ""
+    cpf_match = re.search(r"(?<!\d)\d{3}\.?\d{3}\.?\d{3}-?\d{2}(?!\d)", texto_limpo)
+    if cpf_match:
+        cpf = re.sub(r"\D", "", cpf_match.group())
     else:
-        # Tenta deduzir pela primeira linha que parece um nome (só letras e espaços)
-        for linha in texto_limpo.splitlines():
-            l = linha.strip()
-            if len(l) > 8 and " " in l and not re.search(r"\d", l):
-                nome = l
-                break
-                
-    # 3. Extrair Endereço
+        cns_match = re.search(r"\b\d{15}\b", re.sub(r"[.\-]", "", texto_limpo))
+        if cns_match: cpf = cns_match.group()
+
+    # 2. Tenta extrair Nascimento
+    nascimento = ""
+    nasc_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", texto_limpo)
+    if nasc_match:
+        nascimento = nasc_match.group(1)
+
+    # 3. Tenta extrair Nome (Limpando barras, parentescos e gêneros)
+    nome = ""
+    linhas = texto_limpo.splitlines()
+    if linhas:
+        primeira_linha = linhas[0].strip()
+        # Se for "Belmarques Rodrigues | Sexo Masculino", corta no "|"
+        parte_nome = re.split(r"\||\-|–|Sexo|Idade|Nasceu", primeira_linha, flags=re.IGNORECASE)[0].strip()
+        if len(parte_nome) > 5 and not re.search(r"\d", parte_nome) and "CPF" not in parte_nome.upper():
+            nome = parte_nome
+
+    # 4. Tenta extrair Endereço
     end = ""
     m_end = re.search(r"(?:Endereço|Endereco|Residência|Logradouro|CEP)[:\-\s]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\s\,\.\-\|]{10,})(?:\n|\r|$)", texto_limpo, re.IGNORECASE)
-    if m_end:
-        end = m_end.group(1).strip()
-        
-    return remover_acentos(nome), cpf, limpar_endereco_esus(end)
+    if m_end: end = m_end.group(1).strip()
 
-# --- Funções de manipulação do Drive e Histórico ---
+    return {
+        "nome": remover_acentos(nome),
+        "cpf": cpf,
+        "nascimento": nascimento,
+        "endereco": end
+    }
+
 def obter_id_arquivo_historico() -> str:
-    if "history_file_id" in st.secrets["drive"]:
-        return st.secrets["drive"]["history_file_id"]
-        
+    if "history_file_id" in st.secrets["drive"]: return st.secrets["drive"]["history_file_id"]
     pasta_id = st.secrets["drive"]["folder_historico_id"]
     query = f"'{pasta_id}' in parents and name = '{NOME_ARQUIVO_HISTORICO}' and trashed = false"
-    res = drive_service.files().list(
-        q=query, pageSize=1, fields="files(id, name)",
-        supportsAllDrives=True, includeItemsFromAllDrives=True
-    ).execute()
+    res = drive_service.files().list(q=query, pageSize=1, fields="files(id, name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
     arquivos = res.get("files", [])
-    if arquivos:
-        return arquivos[0]["id"]
+    if arquivos: return arquivos[0]["id"]
     return ID_PADRAO_HISTORICO
 
 def carregar_todo_historico_drive() -> list:
@@ -331,42 +320,31 @@ def carregar_todo_historico_drive() -> list:
         if not conteudo: return []
         dados = json.loads(conteudo)
         return dados if isinstance(dados, list) else []
-    except Exception:
-        return []
+    except Exception: return []
 
 def listar_prescricoes_drive(identificador_limpo: str = None) -> list:
     registros = carregar_todo_historico_drive()
-    if identificador_limpo:
-        registros = [r for r in registros if r.get("cpf_limpo") == identificador_limpo]
+    if identificador_limpo: registros = [r for r in registros if r.get("cpf_limpo") == identificador_limpo]
     return registros
 
 def salvar_prescricao_drive(identificador_limpo: str, nome_paciente: str, texto_prescricao: str) -> str:
     arq_id = obter_id_arquivo_historico()
     registros = carregar_todo_historico_drive()
-    
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
     codigo_registro = f"{identificador_limpo}_{agora.strftime('%d-%m-%Y_%H-%M-%S')}"
     nome_referencia = f"{identificador_limpo}_{agora.strftime('%d-%m-%Y_%H-%M')}.txt"
     data_hora_str = agora.strftime("%d/%m/%Y às %H:%M")
     
     novo_item = {
-        "file_id": codigo_registro,
-        "nome_arquivo": nome_referencia,
-        "cpf_limpo": identificador_limpo,
-        "nome": nome_paciente,
-        "data_hora_str": data_hora_str,
-        "texto": texto_prescricao,
+        "file_id": codigo_registro, "nome_arquivo": nome_referencia,
+        "cpf_limpo": identificador_limpo, "nome": nome_paciente,
+        "data_hora_str": data_hora_str, "texto": texto_prescricao,
         "createdTime": agora.isoformat()
     }
-    
     registros.insert(0, novo_item)
     json_bytes = json.dumps(registros, ensure_ascii=False, indent=2).encode("utf-8")
     media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype="application/json", resumable=False)
-    
-    drive_service.files().update(
-        fileId=arq_id, media_body=media, supportsAllDrives=True
-    ).execute()
-    
+    drive_service.files().update(fileId=arq_id, media_body=media, supportsAllDrives=True).execute()
     return nome_referencia
 
 # ==========================================
@@ -377,20 +355,17 @@ def obter_larguras_fonte_lato() -> list[float]:
     try:
         pdf_bytes = carregar_pdf_template()
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        acro = reader.trailer["/Root"]["/AcroForm"].get_object()
-        lato_obj = acro["/DR"]["/Font"]["/Lato"].get_object()
+        lato_obj = reader.trailer["/Root"]["/AcroForm"].get_object()["/DR"]["/Font"]["/Lato"].get_object()
         return [float(w) for w in lato_obj["/Widths"]]
-    except Exception:
-        return [500.0] * 256
+    except Exception: return [500.0] * 256
 
 def largura_texto_lato_pt(texto: str, font_size_interno: float, widths: list[float]) -> float:
-    b = texto.encode("cp1252", errors="replace")
-    return (sum(widths[ch] for ch in b) / 1000.0) * font_size_interno
+    return (sum(widths[ch] for ch in texto.encode("cp1252", errors="replace")) / 1000.0) * font_size_interno
 
 def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_interno: float, widths: list[float]) -> list[str]:
     linhas_finais = []
-    for linha_bruta in (texto or "").splitlines():
-        linha = linha_bruta.rstrip()
+    for linha in (texto or "").splitlines():
+        linha = linha.rstrip()
         if not linha:
             linhas_finais.append("")
             continue
@@ -405,12 +380,10 @@ def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_inter
             if largura_texto_lato_pt(linha, font_size_interno, widths) <= largura_max_pt:
                 linhas_finais.append(linha)
                 continue
-        palavras = linha.split(" ")
         atual = ""
-        for p in palavras:
+        for p in linha.split(" "):
             teste = f"{atual} {p}".strip() if atual else p
-            if largura_texto_lato_pt(teste, font_size_interno, widths) <= largura_max_pt:
-                atual = teste
+            if largura_texto_lato_pt(teste, font_size_interno, widths) <= largura_max_pt: atual = teste
             else:
                 if atual: linhas_finais.append(atual)
                 atual = p
@@ -421,7 +394,6 @@ def calcular_ajuste_prescricao(texto: str, largura_caixa_pt: float = 350.0, altu
     widths = obter_larguras_fonte_lato()
     texto_limpo = (texto or "").strip()
     if not texto_limpo: return [""], 8.0, TAMANHO_A4_PADRAO
-
     tam_interno_max = TAMANHO_A4_PADRAO / escala_a4
     tam_interno_min = 4.2 / (escala_a4 / FATOR_A4)
 
@@ -460,7 +432,6 @@ def construir_ap_stream_lato(linhas: list[str], largura_rect: float, altura_rect
         if idx == 0: comandos.append(f"{x_pos:.2f} {y_atual:.2f} Td".encode("ascii"))
         else: comandos.append(f"0 {-leading:.2f} Td".encode("ascii"))
         comandos.append(b"(" + escapar_literal_pdf(linha) + b") Tj")
-
     comandos.append(b"ET\nQ\nEMC\nQ\n")
     return b"\n".join(comandos)
 
@@ -491,9 +462,7 @@ def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pa
                 break
 
     linhas_presc, tam_presc_int, tam_presc_a4 = calcular_ajuste_prescricao(texto_prescricao, larg_presc_box, alt_presc_box, escala_a4)
-
-    acro_dr = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()
-    lato_font_ref = acro_dr["/Font"].get_object()["/Lato"]
+    lato_font_ref = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()["/Font"].get_object()["/Lato"]
 
     config_campos = {
         campo_pac: {"valor": texto_cidadao, "linhas": texto_cidadao.splitlines(), "size": tam_padrao_int, "center": False, "multiline": True},
@@ -508,8 +477,8 @@ def preencher_pdf_template(dados_paciente: dict, texto_prescricao: str, campo_pa
             annot = annot_ref.get_object()
             nome_c = annot.get("/T")
             if nome_c not in config_campos: continue
-
             cfg = config_campos[nome_c]
+            
             annot[NameObject("/DR")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/Lato"): lato_font_ref})})
             annot[NameObject("/DA")] = TextStringObject(f"/Lato {cfg['size']} Tf 0 g")
             annot[NameObject("/V")] = TextStringObject(cfg["valor"])
@@ -606,10 +575,8 @@ with st.sidebar:
     aba_selecionada = st.radio("Navegação:", ["📝 Emitir Prescrição", "🗂️ Histórico de Pacientes"])
     st.divider()
     with st.expander("⚙️ Conferência da Base"):
-        try:
-            st.caption(f"Pacientes no CSV: **{len(carregar_base_pacientes())}**")
-        except Exception as e_csv:
-            st.error(f"Erro no CSV: {e_csv}")
+        try: st.caption(f"Pacientes no CSV: **{len(carregar_base_pacientes())}**")
+        except Exception as e_csv: st.error(f"Erro no CSV: {e_csv}")
         campo_pac_input = st.text_input("Campo Cidadão:", value=NOME_CAMPO_PACIENTE_PDF)
         campo_presc_input = st.text_input("Campo Prescrição:", value=NOME_CAMPO_PRESCRICAO_PDF)
 
@@ -630,7 +597,7 @@ if aba_selecionada == "📝 Emitir Prescrição":
         texto_pec = st.text_area(
             "📋 1. Cole o texto do PEC (e-SUS) ou digite Nome / CPF do paciente:",
             height=95,
-            placeholder="Cole aqui os dados do prontuário ou digite o Nome/CPF..."
+            placeholder="Cole aqui os dados do prontuário..."
         )
 
     candidatos = buscar_paciente_no_texto_pec(texto_pec) if texto_pec else []
@@ -639,33 +606,32 @@ if aba_selecionada == "📝 Emitir Prescrição":
         with col_dados_pac:
             paciente = None
             
-            # --- NOVA LÓGICA DE CADASTRO AVULSO ---
+            # --- LÓGICA DE CADASTRO AVULSO ---
             if not candidatos:
-                st.warning("⚠️ Paciente não encontrado no CSV. **Crie o Cadastro Avulso:**")
+                st.warning("⚠️ Paciente não encontrado no CSV. **Cadastro Avulso:**")
+                dados_ext = extrair_dados_brutos_avulsos(texto_pec)
                 
-                # Extrai dados prévios do que o usuário já colou
-                nome_ext, cpf_ext, end_ext = extrair_dados_brutos_avulsos(texto_pec)
-                
-                c_nome, c_cpf = st.columns([2, 1])
-                nome_avulso = c_nome.text_input("Nome Completo (Obrigatório):", value=nome_ext, key="nome_avulso")
-                cpf_avulso = c_cpf.text_input("CPF (Obrigatório):", value=formatar_documento(cpf_ext) if cpf_ext else "", key="cpf_avulso")
+                c_nome, c_cpf, c_nasc = st.columns([2, 1, 1])
+                nome_avulso = c_nome.text_input("Nome Completo (Obrigatório):", value=dados_ext["nome"], key="nome_avulso")
+                cpf_avulso = c_cpf.text_input("CPF (Obrigatório):", value=formatar_documento(dados_ext["cpf"]) if dados_ext["cpf"] else "", key="cpf_avulso")
+                nasc_avulso = c_nasc.text_input("Nascimento:", value=dados_ext["nascimento"], key="nasc_avulso", placeholder="DD/MM/AAAA")
                 
                 if nome_avulso.strip() and cpf_avulso.strip():
                     paciente = {
                         "nome": remover_acentos(nome_avulso.strip()),
                         "cpf_limpo": re.sub(r"\D", "", cpf_avulso),
                         "cpf_formatado": formatar_documento(cpf_avulso),
-                        "endereco": end_ext, 
-                        "nascimento": ""
+                        "endereco": dados_ext["endereco"],
+                        "nascimento": nasc_avulso.strip()
                     }
                 else:
                     st.info("Preencha o Nome e o CPF acima para liberar a emissão da receita.")
             
-            # --- SE ENCONTROU NA BASE DE DADOS NORMAL ---
+            # --- ENCONTRADO NA BASE DE DADOS NORMAL ---
             else:
                 if len(candidatos) > 1:
                     opcoes = {f"{p['nome']} — CPF: {p['cpf_formatado']}": p for p in candidatos}
-                    escolha = st.selectbox("👥 Mais de um paciente encontrado. Selecione:", list(opcoes.keys()))
+                    escolha = st.selectbox("👥 Pacientes encontrados. Selecione:", list(opcoes.keys()))
                     paciente = opcoes[escolha]
                 else:
                     paciente = candidatos[0]
@@ -688,7 +654,7 @@ if aba_selecionada == "📝 Emitir Prescrição":
                     st.markdown(f"**Cidadão:** `{paciente['nome']} - CPF: {paciente['cpf_formatado']}`")
                     
                     if not paciente.get("endereco"):
-                        st.caption("⚠️ Endereço não informado. A linha do endereço ficará vazia na receita se não preenchida.")
+                        st.caption("⚠️ Endereço não preenchido. A linha do endereço ficará vazia na receita se você não informar abaixo.")
                         
                     endereco_editavel = st.text_input(
                         "📍 Endereço (2ª linha do campo CIDADÃO):",
@@ -699,6 +665,9 @@ if aba_selecionada == "📝 Emitir Prescrição":
                     )
                     paciente["endereco"] = endereco_editavel.strip()
 
+        # ==================================
+        # EXIBE A TELA DE PRESCRIÇÃO E PDF
+        # ==================================
         if paciente:
             st.divider()
             col_editor, col_preview = st.columns([1.05, 0.95], gap="large")
@@ -741,7 +710,7 @@ if aba_selecionada == "📝 Emitir Prescrição":
             with col_btn_dl:
                 agora_local = datetime.now(ZoneInfo("America/Sao_Paulo"))
                 nome_pdf_dl = f"Prescricao_{paciente['nome'].replace(' ', '_')}_{agora_local.strftime('%d-%m-%Y')}.pdf"
-                st.download_button(label="⬇️ Baixar PDF (Opcional)", data=pdf_preview_bytes, file_name=nome_pdf_dl, mime="application/pdf", use_container_width=True)
+                st.download_button(label="⬇️ Baixar PDF", data=pdf_preview_bytes, file_name=nome_pdf_dl, mime="application/pdf", use_container_width=True)
 
             with col_preview:
                 renderizar_visualizador_e_impressao_pdf(pdf_preview_bytes, altura_px=740)
