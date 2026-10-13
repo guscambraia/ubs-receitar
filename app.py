@@ -15,6 +15,7 @@ from pypdf.generic import (
     DictionaryObject,
     ArrayObject,
     FloatObject,
+    NumberObject,
     DecodedStreamObject,
     ByteStringObject,
 )
@@ -37,14 +38,12 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap');
 
-/* Aproveita o máximo da tela */
 .block-container {
     padding-top: 1.2rem !important;
     padding-bottom: 1rem !important;
     max-width: 98% !important;
 }
 
-/* Estiliza o editor de prescrição para simular exatamente a caixa PRESCRIÇÃO na folha A4 */
 div[data-testid="stTextArea"] textarea {
     font-family: 'Lato', sans-serif !important;
     font-size: 15.2px !important; /* Equivalente a 11,41 pt em tela (96 DPI) */
@@ -67,7 +66,7 @@ ID_PADRAO_HISTORICO = "1RFtMetxdO2B8MioNsSC9SMi7MiUMCDC_"
 
 # Tamanhos de fonte desejados na escala de impressão A4:
 # (No template base 417x588 pt, o fator para A4 595.28x841.89 pt é 1.42625 -> 11.41 / 1.42625 = 8.0 pt e 8.56 / 1.42667 = 6.0 pt)
-FATOR_A4 = 11.41 / 8.0  # 1.42625
+FATOR_A4 = 11.41 / 8.0
 TAMANHO_A4_PADRAO = 11.41
 TAMANHO_A4_DATA_HORA = 8.56
 
@@ -373,16 +372,11 @@ def obter_larguras_fonte_lato() -> list[float]:
         return [500.0] * 256
 
 def largura_texto_lato_pt(texto: str, font_size_interno: float, widths: list[float]) -> float:
-    """Calcula a largura exata (em pontos PDF) de uma string na fonte Lato."""
     b = texto.encode("cp1252", errors="replace")
     soma = sum(widths[ch] for ch in b)
     return (soma / 1000.0) * font_size_interno
 
 def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_interno: float, widths: list[float]) -> list[str]:
-    """
-    Quebra cada parágrafo do texto exatamente como o PDF fará dentro da largura da caixa,
-    garantindo que nenhuma palavra saia pelas bordas laterais.
-    """
     linhas_finais = []
     for linha_bruta in (texto or "").splitlines():
         linha = linha_bruta.rstrip()
@@ -392,7 +386,6 @@ def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_inter
         if largura_texto_lato_pt(linha, font_size_interno, widths) <= largura_max_pt:
             linhas_finais.append(linha)
             continue
-        # Se for uma linha com tracejado longo ("--- CONT"), reduz hifens primeiro para tentar manter na mesma linha
         if "-----" in linha:
             while "-----" in linha and largura_texto_lato_pt(linha, font_size_interno, widths) > largura_max_pt:
                 nova = re.sub(r"-{6,}", lambda m: m.group(0)[:-2], linha, count=1)
@@ -402,7 +395,6 @@ def quebrar_linhas_para_caixa(texto: str, largura_max_pt: float, font_size_inter
             if largura_texto_lato_pt(linha, font_size_interno, widths) <= largura_max_pt:
                 linhas_finais.append(linha)
                 continue
-        # Quebra palavra por palavra se ainda ultrapassar a largura
         palavras = linha.split(" ")
         atual = ""
         for p in palavras:
@@ -425,19 +417,16 @@ def calcular_ajuste_prescricao(
 ) -> tuple[list[str], float, float]:
     """
     Sempre busca o tamanho máximo 11,41 pt (na escala A4, equivalente a 8,00 pt na escala base do template).
-    Se todo o texto couber em 11,41 pt sem sobrar nada, mantém 11,41 pt.
-    Caso ultrapasse a altura da caixa PRESCRIÇÃO, reduz aos poucos (de 0,1 em 0,1 pt interno)
-    até encontrar o maior tamanho onde 100% das linhas cabem dentro do campo.
+    Só reduz aos poucos se o texto ultrapassar a altura da caixa PRESCRIÇÃO.
     """
     widths = obter_larguras_fonte_lato()
     texto_limpo = (texto or "").strip()
     if not texto_limpo:
         return [""], 8.0, TAMANHO_A4_PADRAO
 
-    tam_interno_max = TAMANHO_A4_PADRAO / escala_a4  # 8.00 pt no template 417x588 (ou 11.41 se o template for A4)
+    tam_interno_max = TAMANHO_A4_PADRAO / escala_a4
     tam_interno_min = 4.2 / (escala_a4 / FATOR_A4)
 
-    # 1ª Tentativa: Com o texto exatamente como digitado, começando em 11,41 pt (A4) e reduzindo aos poucos
     tam = tam_interno_max
     while tam >= tam_interno_min:
         linhas_quebradas = quebrar_linhas_para_caixa(texto_limpo, largura_caixa_pt, tam, widths)
@@ -447,7 +436,6 @@ def calcular_ajuste_prescricao(
             return linhas_quebradas, round(tam, 2), round(tam * escala_a4, 2)
         tam -= 0.10
 
-    # 2ª Tentativa (Se o texto tiver dezenas de linhas em branco extras): compacta linhas vazias repetidas
     texto_compacto = re.sub(r"\n\s*\n+", "\n\n", texto_limpo)
     texto_compacto = re.sub(
         r"(^\s*(?:\d+\.|USO\s).+)\n\n+(?=\S)",
@@ -468,7 +456,6 @@ def calcular_ajuste_prescricao(
     return linhas_finais, 3.5, round(3.5 * escala_a4, 2)
 
 def escapar_literal_pdf(texto: str) -> bytes:
-    """Converte string para bytes WinAnsiEncoding (cp1252) escapando parênteses e barras para fluxo PDF."""
     b = texto.encode("cp1252", errors="replace")
     b = b.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
     return b
@@ -482,10 +469,6 @@ def construir_ap_stream_lato(
     multilinha: bool = True,
     widths: list[float] = None
 ) -> bytes:
-    """
-    Gera o fluxo de aparência (/AP /N) nativo do PDF usando exclusivamente a fonte /Lato,
-    com posicionamento vertical e horizontal exatos.
-    """
     if widths is None:
         widths = obter_larguras_fonte_lato()
         
@@ -493,7 +476,6 @@ def construir_ap_stream_lato(
     if multilinha:
         y_inicial = altura_rect - font_size - 2.0
     else:
-        # Centraliza verticalmente em campos de 1 linha (DATA e DATA_HORA)
         y_inicial = max(1.5, (altura_rect - font_size) / 2.0 + 1.0)
 
     comandos = [
@@ -525,12 +507,12 @@ def preencher_pdf_template(
     campo_presc: str = NOME_CAMPO_PRESCRICAO_PDF
 ) -> tuple[bytes, float]:
     """
-    Preenche todos os 4 campos do template.pdf ('CIDADÃO', 'PRESCRIÇÃO', 'DATA', 'DATA_HORA')
-    garantindo que TODOS usem a fonte Lato embutida e aplicando os tamanhos exatos:
+    Preenche os 4 campos do template.pdf ('CIDADÃO', 'PRESCRIÇÃO', 'DATA', 'DATA_HORA')
+    em fonte Lato:
     - CIDADÃO: Lato 11,41 pt (A4)
     - DATA: Lato 11,41 pt (A4)
     - DATA_HORA: Lato 8,56 pt (A4)
-    - PRESCRIÇÃO: Lato dinâmico iniciando em 11,41 pt (A4) e reduzindo apenas se necessário.
+    - PRESCRIÇÃO: Lato dinâmico iniciando em 11,41 pt (A4).
     """
     pdf_bytes = carregar_pdf_template()
     writer = PdfWriter(clone_from=io.BytesIO(pdf_bytes))
@@ -538,25 +520,20 @@ def preencher_pdf_template(
 
     pagina = writer.pages[0]
     largura_pag = float(pagina.mediabox.width)
-    # Se a página do template tiver 417 pt de largura, o fator para A4 é 1.42625 (11.41 / 8.0).
-    # Se o template já estiver em A4 (595 pt), o fator é 1.0.
     escala_a4 = FATOR_A4 if largura_pag < 500 else 1.0
 
-    tam_padrao_int = round(TAMANHO_A4_PADRAO / escala_a4, 2)      # 8.00 pt (equivale a 11,41 pt em A4)
-    tam_datahora_int = round(TAMANHO_A4_DATA_HORA / escala_a4, 2) # 6.00 pt (equivale a 8,56 pt em A4)
+    tam_padrao_int = round(TAMANHO_A4_PADRAO / escala_a4, 2)
+    tam_datahora_int = round(TAMANHO_A4_DATA_HORA / escala_a4, 2)
 
-    # 1. Monta o texto do CIDADÃO (Nome - CPF na 1ª linha, Endereço na 2ª linha)
     linha_1 = f"{dados_paciente['nome']} - CPF: {dados_paciente['cpf_formatado']}"
     endereco_val = limpar_endereco_esus(dados_paciente.get("endereco", ""))
     linhas_cidadao = [linha_1, endereco_val] if endereco_val else [linha_1]
     texto_cidadao = "\n".join(linhas_cidadao)
 
-    # 2. Monta DATA e DATA_HORA
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
     texto_data = f"Divinópolis - MG, {agora.strftime('%d')} de {MESES_PT[agora.month - 1]} de {agora.year}"
     texto_data_hora = f"{agora.strftime('%d/%m/%Y')} às {agora.strftime('%H:%M')}"
 
-    # 3. Mede a caixa PRESCRIÇÃO real do PDF e calcula o tamanho dinâmico da fonte Lato (máx 11,41 pt A4)
     larg_presc_box, alt_presc_box = 350.0, 316.0
     if "/Annots" in pagina:
         for annot_ref in pagina["/Annots"]:
@@ -575,7 +552,6 @@ def preencher_pdf_template(
     )
     texto_presc_final = "\n".join(linhas_presc)
 
-    # Obtém a referência da fonte /Lato do /AcroForm para injetar em todos os campos
     acro_dr = writer._root_object["/AcroForm"].get_object()["/DR"].get_object()
     lato_font_ref = acro_dr["/Font"].get_object()["/Lato"]
 
@@ -610,7 +586,6 @@ def preencher_pdf_template(
         }
     }
 
-    # 4. Atualiza os campos no AcroForm e nas Anotações da página
     for p in writer.pages:
         if "/Annots" not in p:
             continue
@@ -623,7 +598,6 @@ def preencher_pdf_template(
             cfg = config_campos[nome_c]
             f_size = cfg["size"]
 
-            # Remove o /DR antigo (que tinha apenas /Helv = Arial em CIDADÃO e DATA) e força /Lato
             annot[NameObject("/DR")] = DictionaryObject({
                 NameObject("/Font"): DictionaryObject({
                     NameObject("/Lato"): lato_font_ref
@@ -634,7 +608,6 @@ def preencher_pdf_template(
             if "/AA" in annot:
                 del annot["/AA"]
 
-            # Constrói o fluxo visual (/AP /N) cravado na fonte Lato
             rect = [float(x) for x in annot.get("/Rect")]
             w_box = abs(rect[2] - rect[0])
             h_box = abs(rect[3] - rect[1])
@@ -649,28 +622,32 @@ def preencher_pdf_template(
                 widths=widths
             )
 
+            # Uso de NumberObject(1) e NumberObject(0) compatível com pypdf write_to_stream
             ap_stream_obj = DecodedStreamObject.initialize_from_dictionary({
                 NameObject("/Type"): NameObject("/XObject"),
                 NameObject("/Subtype"): NameObject("/Form"),
-                NameObject("/FormType"): 1,
-                NameObject("/BBox"): ArrayObject([FloatObject(0.0), FloatObject(0.0), FloatObject(w_box), FloatObject(h_box)]),
+                NameObject("/FormType"): NumberObject(1),
+                NameObject("/BBox"): ArrayObject([
+                    FloatObject(0.0),
+                    FloatObject(0.0),
+                    FloatObject(w_box),
+                    FloatObject(h_box)
+                ]),
                 NameObject("/Resources"): DictionaryObject({
                     NameObject("/Font"): DictionaryObject({
                         NameObject("/Lato"): lato_font_ref
                     })
                 }),
                 "__streamdata__": ByteStringObject(stream_bytes),
-                "/Length": 0
+                NameObject("/Length"): NumberObject(0)
             })
 
             annot[NameObject("/AP")] = DictionaryObject({
                 NameObject("/N"): writer._add_object(ap_stream_obj)
             })
 
-    # Desativa NeedAppearances para que o navegador e o Acrobat usem o desenho Lato exato que geramos
     writer.set_need_appearances_writer(False)
 
-    # Remove scripts antigos para não sobrescreverem os campos na abertura
     if "/Names" in writer._root_object:
         names_obj = writer._root_object["/Names"].get_object()
         if "/JavaScript" in names_obj:
@@ -778,7 +755,6 @@ def renderizar_visualizador_e_impressao_pdf(pdf_bytes: bytes, altura_px: int = 7
             const pdfBlob = new Blob([byteArray], {{ type: 'application/pdf' }});
             const blobUrl = URL.createObjectURL(pdfBlob);
 
-            // Carrega no iframe oculto para impressão direta com 1 clique
             const printFrame = document.getElementById('print-iframe');
             printFrame.src = blobUrl;
 
@@ -788,7 +764,7 @@ def renderizar_visualizador_e_impressao_pdf(pdf_bytes: bytes, altura_px: int = 7
                     printFrame.contentWindow.print();
                 }} catch (e) {{
                     const win = window.open(blobUrl, '_blank');
-                    if (win) win. focus();
+                    if (win) win.focus();
                 }}
             }}
 
@@ -796,7 +772,6 @@ def renderizar_visualizador_e_impressao_pdf(pdf_bytes: bytes, altura_px: int = 7
                 window.open(blobUrl, '_blank');
             }}
 
-            // Renderiza a página do PDF no Canvas com nitidez alta (escala 2x) usando PDF.js
             const pdfjsLib = window['pdfjs-dist/build/pdf'];
             pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
@@ -851,7 +826,6 @@ with st.sidebar:
 # 6. TELA 1: EMITIR PRESCRIÇÃO (TELA CHEIA A4 + PREVIEW AO VIVO)
 # ==========================================
 if aba_selecionada == "📝 Emitir Prescrição":
-    # Topo compacto para identificar ou selecionar o paciente
     col_input_pec, col_dados_pac = st.columns([1, 1.3], gap="medium")
     
     with col_input_pec:
@@ -901,7 +875,6 @@ if aba_selecionada == "📝 Emitir Prescrição":
 
         st.divider()
 
-        # Área principal aproveitando o máximo da tela: Editor A4 à esquerda e Folha PDF ao vivo à direita
         col_editor, col_preview = st.columns([1.05, 0.95], gap="large")
 
         with col_editor:
@@ -910,14 +883,12 @@ if aba_selecionada == "📝 Emitir Prescrição":
             else:
                 st.caption("✨ Paciente sem receita anterior no Drive — iniciando prescrição em branco")
 
-            # Chave vinculada ao CPF (f"editor_presc_{id_busca}") garante recarregamento imediato ao trocar de paciente
             texto_editado = st.text_area(
                 "💊 2. Campo PRESCRIÇÃO (Proporção real da folha A4 em fonte Lato):",
                 key=f"editor_presc_{id_busca}",
                 height=620
             )
 
-            # Calcula ao vivo o tamanho da fonte Lato (Máx 11,41 pt)
             linhas_calc, _, tam_lato_a4 = calcular_ajuste_prescricao(texto_editado)
             cor_badge = "green" if tam_lato_a4 >= 11.4 else "orange"
             st.markdown(
@@ -934,7 +905,6 @@ if aba_selecionada == "📝 Emitir Prescrição":
                     use_container_width=True
                 )
 
-        # Gera o PDF em memória em tempo real para visualização imediata e impressão sem precisar salvar antes
         pdf_preview_bytes, _ = preencher_pdf_template(
             dados_paciente=paciente,
             texto_prescricao=texto_editado,
